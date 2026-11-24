@@ -112,16 +112,18 @@ app.get('/api/stream/:fileId', async (req, res) => {
   }
 });
 
-app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   const transientDatabaseCodes = new Set(['ETIMEDOUT','ECONNREFUSED','ECONNRESET','EHOSTUNREACH','ENETUNREACH','ENOTFOUND','57P03','08000','08001','08003','08006']);
   const databaseUnavailable = transientDatabaseCodes.has(String(err?.code || ''));
   const missingConfiguration = typeof err?.message === 'string' && err.message.startsWith('Missing required environment variable:');
   const missingVariable = missingConfiguration ? err.message.slice('Missing required environment variable:'.length).trim() : '';
   const status = err?.code === 'LIMIT_FILE_SIZE' ? 413 : databaseUnavailable || missingConfiguration ? 503 : Number(err?.statusCode) >= 400 && Number(err.statusCode) < 600 ? Number(err.statusCode) : 500;
-  logger.error('api_request_failed',{error_name:err?.name||'Error',error_class:databaseUnavailable?'database_unavailable':missingConfiguration?'service_configuration_incomplete':err?.code||'internal'});
+  const requestId=String(res.getHeader('x-request-id')||'');
+  logger.error('api_request_failed',{request_id:requestId,error_name:err?.name||'Error',error_class:databaseUnavailable?'database_unavailable':missingConfiguration?'service_configuration_incomplete':err?.code||'internal',error_message:String(err?.message||'').slice(0,500),method:req.method,path:req.path});
   res.status(status).json({ error: {
     code: status === 413 ? 'PAYLOAD_TOO_LARGE' : databaseUnavailable ? 'DATABASE_UNAVAILABLE' : missingConfiguration ? 'SERVICE_NOT_CONFIGURED' : err?.publicCode || (status === 400 ? 'BAD_REQUEST' : 'INTERNAL'),
     message: status === 413 ? `Maximum upload size is ${process.env.MAX_UPLOAD_MB || 20} MB` : databaseUnavailable ? 'The database is unavailable. Check the server health endpoint and DATABASE_URL configuration.' : missingConfiguration ? `Server configuration is missing ${missingVariable}. Contact the administrator.` : err?.publicMessage || (status === 400 ? 'Invalid request' : 'Internal server error'),
+    requestId,
   } });
 });
 const port = Number(process.env.PORT || 3000);

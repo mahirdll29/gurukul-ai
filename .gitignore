@@ -84,4 +84,6 @@ docker-compose.override.yml
 # ============================================================
 *.tgz
 *.zip
+*.ppt
+*.pptx
 package-lock.json

@@ -28,31 +28,49 @@ async function generate(system: string, contents: GeminiTurn[], json: boolean) {
             contents,
             generationConfig: { temperature: 0.3, ...(json ? { responseMimeType: 'application/json' } : {}) },
           }),
+          signal: AbortSignal.timeout(Number(process.env.LLM_TIMEOUT_MS || 45_000)),
         });
       } catch (err: any) {
+        lastStatus = 0;
         lastErrorMsg = err?.message || 'Network error';
         break;
       }
 
       if (response && response.ok) {
-        const payload: any = await response.json();
+        let payload: any;
+        try { payload = await response.json(); }
+        catch { lastStatus = response.status; lastErrorMsg = 'Gemini returned invalid JSON'; break; }
         const text = payload.candidates?.[0]?.content?.parts?.map((part: any) => part.text || '').join('').trim();
         if (text) return text;
+        lastStatus = response.status;
+        lastErrorMsg = payload.promptFeedback?.blockReason || 'Gemini returned no text candidate';
+        break;
       }
 
       lastStatus = response?.status || 0;
+      try {
+        const payload: any = await response?.clone().json();
+        lastErrorMsg = payload.error?.message || lastErrorMsg;
+      } catch { /* Keep the transport error when the provider returned no JSON body. */ }
       if (![404, 429, 500, 503].includes(lastStatus)) {
         // Unrecoverable status for this model
         break;
       }
       await new Promise(resolve => setTimeout(resolve, 300 * 2 ** attempt));
     }
+    if (!lastStatus && lastErrorMsg) break;
+    if ([400, 401, 403].includes(lastStatus)) break;
   }
 
+  const publicMessage = !lastStatus
+    ? 'Could not connect to Gemini. Check outbound network access and the Gemini API key.'
+    : lastStatus === 200
+      ? 'Gemini returned no answer. Check whether the prompt was blocked, then try again.'
+      : `Gemini returned HTTP ${lastStatus}. Check the API key, model access, and usage quota.`;
   throw Object.assign(new Error(`Gemini generation failed (${lastStatus || lastErrorMsg}).`), {
     statusCode: 502,
     publicCode: 'AI_UNAVAILABLE',
-    publicMessage: `The AI provider returned HTTP ${lastStatus || 'unavailable'}. Check API key and usage quota.`,
+    publicMessage,
   });
 }
 

@@ -14,6 +14,7 @@ export async function embedTexts(texts:string[]):Promise<number[][]>{
       response=await fetch(`${endpoint}/${encodeURIComponent(model)}:batchEmbedContents`,{
         method:'POST',headers:{'content-type':'application/json','x-goog-api-key':key},
         body:JSON.stringify({requests:batch.map(text=>({model:`models/${model}`,content:{parts:[{text}]},embedContentConfig:{outputDimensionality:768}}))}),
+        signal:AbortSignal.timeout(Number(process.env.EMBEDDING_TIMEOUT_MS||30_000)),
       });
       if(response.status!==429)break;
       if(attempt<4)await sleep(250*2**attempt);

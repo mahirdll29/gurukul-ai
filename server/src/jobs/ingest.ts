@@ -32,7 +32,16 @@ export async function processVersion(versionId:string,buffer?:Buffer,leaseValid:
     if(!leaseValid())throw new Error('Ingestion lease lost');
     const units=await parseDocument(q.rows[0].format,bytes);
     if(!leaseValid())throw new Error('Ingestion lease lost');
-    await transaction(async c=>{await c.query('DELETE FROM units WHERE version_id=$1',[versionId]);for(const u of units)await c.query(`INSERT INTO units(version_id,idx,locator,text,text_hash,char_count) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(version_id,idx) DO UPDATE SET locator=EXCLUDED.locator,text=EXCLUDED.text,text_hash=EXCLUDED.text_hash,char_count=EXCLUDED.char_count`,[versionId,u.idx,u.locator,u.text,u.text_hash,u.char_count]);});
+    await transaction(async c=>{
+      await c.query('DELETE FROM units WHERE version_id=$1',[versionId]);
+      if(units.length)await c.query(`INSERT INTO units(version_id,idx,locator,text,text_hash,char_count)
+        SELECT $1,src.idx,src.locator,src.text,src.text_hash,src.char_count
+        FROM unnest($2::int[],$3::text[],$4::text[],$5::text[],$6::int[])
+          AS src(idx,locator,text,text_hash,char_count)
+        ON CONFLICT(version_id,idx) DO UPDATE SET locator=EXCLUDED.locator,text=EXCLUDED.text,text_hash=EXCLUDED.text_hash,char_count=EXCLUDED.char_count`,[
+        versionId,units.map(x=>x.idx),units.map(x=>x.locator),units.map(x=>x.text),units.map(x=>x.text_hash),units.map(x=>x.char_count)
+      ]);
+    });
     if(units.length){
       const embeddedUnits=units.filter(unit=>unit.char_count>=5);
       for(let i=0;i<embeddedUnits.length;i+=20){
@@ -40,7 +49,10 @@ export async function processVersion(versionId:string,buffer?:Buffer,leaseValid:
         const batch=embeddedUnits.slice(i,i+20),existing=await pool.query('SELECT DISTINCT ON(text_hash) text_hash,embedding::text FROM units WHERE text_hash=ANY($1) AND embedding IS NOT NULL',[batch.map(x=>x.text_hash)]),vectors=new Map(existing.rows.map(x=>[x.text_hash,x.embedding]));
         const missing=batch.filter(x=>!vectors.has(x.text_hash));
         if(missing.length){const em=await embedTexts(missing.map(x=>`Represent this document for retrieval: ${x.text.slice(0,6000)}`));for(let k=0;k<missing.length;k++)vectors.set(missing[k].text_hash,`[${em[k].join(',')}]`);}
-        for(const unit of batch){const vector=vectors.get(unit.text_hash);if(vector)await pool.query('UPDATE units SET embedding=$1::vector WHERE version_id=$2 AND idx=$3',[vector,versionId,unit.idx]);}
+        const updates=batch.flatMap(unit=>{const vector=vectors.get(unit.text_hash);return vector?[[unit.idx,vector] as const]:[];});
+        if(updates.length)await pool.query(`UPDATE units u SET embedding=src.embedding::vector
+          FROM unnest($1::int[],$2::text[]) AS src(idx,embedding)
+          WHERE u.version_id=$3 AND u.idx=src.idx`,[updates.map(x=>x[0]),updates.map(x=>x[1]),versionId]);
       }
     }
     if(!leaseValid())throw new Error('Ingestion lease lost');
@@ -58,7 +70,7 @@ export async function processVersion(versionId:string,buffer?:Buffer,leaseValid:
       await c.query('UPDATE files SET current_version_id=$1 WHERE id=$2',[versionId,v.file_id]);
       return{fileId:v.file_id,userId:v.uploaded_by,searchable:f.searchable};
     });
-    if(details.searchable)try{await scanSimilar(versionId,details.userId,details.fileId);}catch(e){logger.error('similarity_scan_failed',{version_id:versionId,error:e instanceof Error?e.message:'unknown error'});}
+    if(details.searchable)void scanSimilar(versionId,details.userId,details.fileId).catch(e=>logger.error('similarity_scan_failed',{version_id:versionId,error:e instanceof Error?e.message:'unknown error'}));
   }catch(e){
     logger.error('ingestion_attempt_failed', { version_id: versionId, error: e instanceof Error ? e.message : 'unknown error' });
     throw e;

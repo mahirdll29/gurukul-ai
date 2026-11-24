@@ -6,6 +6,7 @@ import { hybridRetrieve } from '../core/retrieval.js';
 import { logClassroomUsageSafely } from '../core/analytics.js';
 import { sha256 } from '../core/hash.js';
 import { putObject } from '../core/storage.js';
+import { logger } from '../core/logger.js';
 import { createRequire } from 'node:module';
 
 const _require = createRequire(import.meta.url);
@@ -64,6 +65,7 @@ r.get('/library', async (req, res, next) => {
 // Core AI assistant: retrieve relevant passages from selected files, then
 // call Gemini to answer the user question with citations.
 r.post('/ask', async (req, res, next) => {
+  let stage = 'validation';
   try {
     const { question, fileIds, history = [] } = req.body || {};
 
@@ -78,14 +80,17 @@ r.post('/ask', async (req, res, next) => {
     if(fileIds.length>100||fileIds.some((id:any)=>typeof id!=='string'||!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id)))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Choose up to 100 valid file ids.'}});
 
     const userId = req.user!.id;
+    stage = 'retrieval';
     const retrieval = await hybridRetrieve({userId,query:question.trim(),fileIds,limit:Number(process.env.RETRIEVAL_TOP_K||8),mode:'hybrid'});
     const relevantUnits = retrieval.results.map(hit=>({...hit,score:hit.score}));
     logClassroomUsageSafely(userId,'assistant',question.trim(),relevantUnits.map(x=>x.unit_id));
 
-    // Load every indexed unit from the selected files. For documents that fit
-    // in the context budget this lets broad questions use the complete file;
-    // longer selections still start with semantically relevant passages.
-    const allUnitsResult = await pool.query(
+    // Only load an exact page when the question asks for one. Loading every
+    // unit in every selected file on each turn made large libraries slow.
+    const pageMatch = question.match(/\b(?:page|pg\.?|p\.)\s*(\d+)\b/i);
+    const requestedPage = pageMatch ? Number(pageMatch[1]) : null;
+    stage = 'page_lookup';
+    const requestedPageUnits = requestedPage === null ? [] : (await pool.query(
         `SELECT u.id unit_id, u.locator, u.text, f.id file_id, f.name file_name, f.format, fv.id version_id, u.idx, 0 AS score
          FROM units u
          JOIN file_versions fv ON fv.id = u.version_id
@@ -93,6 +98,7 @@ r.post('/ask', async (req, res, next) => {
          WHERE fv.status = 'ready' AND f.current_version_id = fv.id
            AND f.deleted_at IS NULL AND f.archived_at IS NULL AND f.searchable = true
            AND f.id = ANY($1::uuid[])
+           AND f.format = 'pdf' AND u.locator = $3
            AND (
              (f.owner_type = 'user' AND f.owner_id = $2)
              OR (
@@ -107,18 +113,9 @@ r.post('/ask', async (req, res, next) => {
              )
            )
          ORDER BY f.id, u.idx`,
-        [fileIds, userId]
-      );
-    const allUnits = allUnitsResult.rows;
-
-    // Page-number questions must not depend on vector similarity: route them
-    // directly to the exact extracted PDF page(s).
-    const pageMatch = question.match(/\b(?:page|pg\.?|p\.)\s*(\d+)\b/i);
-    const requestedPage = pageMatch ? Number(pageMatch[1]) : null;
-    const requestedPageUnits = requestedPage === null ? [] : allUnits.filter(
-      unit => unit.format === 'pdf' && unit.locator === `Page ${requestedPage}`
-    );
-    if (requestedPage !== null && allUnits.some(unit => unit.format === 'pdf') && requestedPageUnits.length === 0) {
+        [fileIds, userId, `Page ${requestedPage}`]
+      )).rows;
+    if (requestedPage !== null && requestedPageUnits.length === 0) {
       return res.status(422).json({
         error: {
           code: 'PAGE_TEXT_UNAVAILABLE',
@@ -127,18 +124,8 @@ r.post('/ask', async (req, res, next) => {
       });
     }
 
-    if (allUnits.length === 0) {
-      return res.status(422).json({
-        error: {
-          code: 'NO_CONTENT',
-          message: 'The selected files have no indexed text yet. Wait for processing to complete, then try again.',
-        },
-      });
-    }
-
     // Step 3: Build context string for Gemini (cap at MAX_CONTEXT_CHARS)
     const maxChars = Number(process.env.MAX_CONTEXT_CHARS || 120000);
-    const allChars = allUnits.reduce((total, unit) => total + unit.text.length + unit.locator.length + unit.file_name.length + 24, 0);
     if (!requestedPageUnits.length && relevantUnits.length===0) return res.json({answer:"I couldn't find relevant information in the selected files.",sources:[],degraded:retrieval.degraded});
     const contextUnits = requestedPageUnits.length
       ? requestedPageUnits
@@ -179,6 +166,7 @@ ${contextStr}
 
 Answer the student's question based strictly on these excerpts.`;
 
+    stage = 'gemini_generation';
     const answer = await generateText(systemPrompt, question.trim(), geminiHistory);
 
     // Step 6: Build sources list (deduplicated by file+locator)
@@ -199,7 +187,10 @@ Answer the student's question based strictly on these excerpts.`;
       });
 
     res.json({ answer, sources, degraded:retrieval.degraded });
-  } catch (e) { next(e); }
+  } catch (e) {
+    logger.error('assistant_request_failed',{request_id:String(res.getHeader('x-request-id')||''),stage,error_name:e instanceof Error?e.name:'Error',error_message:String(e instanceof Error?e.message:e).slice(0,500)});
+    next(e);
+  }
 });
 
 // ─── Helper: get source units for generation tasks ─────────────────────────────

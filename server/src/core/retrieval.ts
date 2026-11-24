@@ -1,5 +1,6 @@
 import { pool } from '../db/pool.js';
 import { embedText } from './embed.js';
+import { logger } from './logger.js';
 
 export type RetrievalHit=Record<string,any>&{unit_id:string;vector_score?:number;keyword_score?:number;signals:string[];score:number};
 export function reciprocalRankFusion(lists:RetrievalHit[][],limit:number,constant=60){
@@ -8,19 +9,32 @@ export function reciprocalRankFusion(lists:RetrievalHit[][],limit:number,constan
   return [...combined.values()].sort((a,b)=>b.score-a.score).slice(0,limit);
 }
 
-const access=`((f.owner_type='user' AND f.owner_id=$4) OR (f.owner_type='org' AND f.owner_id IN(SELECT org_id FROM memberships WHERE user_id=$4) AND (f.created_by=$4 OR f.visibility='classroom' OR EXISTS(SELECT 1 FROM memberships fac WHERE fac.user_id=$4 AND fac.org_id=f.owner_id AND fac.role='faculty') OR EXISTS(SELECT 1 FROM file_shares fs WHERE fs.file_id=f.id AND fs.user_id=$4)))`;
+const access=`((f.owner_type='user' AND f.owner_id=$4) OR (f.owner_type='org' AND f.owner_id IN(SELECT org_id FROM memberships WHERE user_id=$4) AND (f.created_by=$4 OR f.visibility='classroom' OR EXISTS(SELECT 1 FROM memberships fac WHERE fac.user_id=$4 AND fac.org_id=f.owner_id AND fac.role='faculty') OR EXISTS(SELECT 1 FROM file_shares fs WHERE fs.file_id=f.id AND fs.user_id=$4))))`;
 export async function hybridRetrieve(input:{userId:string;query:string;fileIds?:string[]|null;name?:string|null;limit:number;mode?:'hybrid'|'semantic'|'keyword'}){
   const mode=input.mode||'hybrid',query=input.query.trim();let vector:string|null=null,degraded=false;
   if(mode!=='keyword')try{vector=`[${(await embedText(`Represent this question for retrieving relevant document passages: ${query}`)).join(',')}]`;}catch{degraded=true;}
   const params=[query,input.fileIds?.length?input.fileIds:null,input.name?`%${input.name}%`:null,input.userId] as any[];
   const candidates:RetrievalHit[][]=[];
   if(vector){
-    const q=await pool.query(`SELECT u.id unit_id,u.locator,u.text,f.id file_id,f.name file_name,fv.id version_id,1-(u.embedding <=> $5::vector) vector_score FROM units u JOIN file_versions fv ON fv.id=u.version_id JOIN files f ON f.id=fv.file_id WHERE u.embedding IS NOT NULL AND fv.status='ready' AND fv.retracted_at IS NULL AND f.current_version_id=fv.id AND f.deleted_at IS NULL AND f.archived_at IS NULL AND f.searchable=true AND ($2::uuid[] IS NULL OR f.id=ANY($2)) AND ($3::text IS NULL OR f.name ILIKE $3) AND ${access} ORDER BY u.embedding <=> $5::vector LIMIT $6`,[...params,vector,Math.max(input.limit*4,20)]);
+    const vectorAccess=access.replaceAll('$4','$3');
+    const q=await pool.query(`SELECT u.id unit_id,u.locator,u.text,f.id file_id,f.name file_name,fv.id version_id,1-(u.embedding <=> $4::vector) vector_score FROM units u JOIN file_versions fv ON fv.id=u.version_id JOIN files f ON f.id=fv.file_id WHERE u.embedding IS NOT NULL AND fv.status='ready' AND fv.retracted_at IS NULL AND f.current_version_id=fv.id AND f.deleted_at IS NULL AND f.archived_at IS NULL AND f.searchable=true AND ($1::uuid[] IS NULL OR f.id=ANY($1)) AND ($2::text IS NULL OR f.name ILIKE $2) AND ${vectorAccess} ORDER BY u.embedding <=> $4::vector LIMIT $5`,[input.fileIds?.length?input.fileIds:null,input.name?`%${input.name}%`:null,input.userId,vector,Math.max(input.limit*4,20)]);
     candidates.push(q.rows.filter(x=>Number(x.vector_score)>=Number(process.env.RETRIEVAL_MIN_SCORE||0.35)).map(x=>({...x,score:0,signals:[]})));
   }
   if(mode!=='semantic'||degraded){
-    const q=await pool.query(`SELECT u.id unit_id,u.locator,u.text,f.id file_id,f.name file_name,fv.id version_id,ts_rank_cd(u.tsv,websearch_to_tsquery('english',$1)) keyword_score FROM units u JOIN file_versions fv ON fv.id=u.version_id JOIN files f ON f.id=fv.file_id WHERE u.tsv @@ websearch_to_tsquery('english',$1) AND fv.status='ready' AND fv.retracted_at IS NULL AND f.current_version_id=fv.id AND f.deleted_at IS NULL AND f.archived_at IS NULL AND f.searchable=true AND ($2::uuid[] IS NULL OR f.id=ANY($2)) AND ($3::text IS NULL OR f.name ILIKE $3) AND ${access} ORDER BY keyword_score DESC LIMIT $5`,[...params,Math.max(input.limit*4,20)]);
-    candidates.push(q.rows.filter(x=>Number(x.keyword_score)>=0.01).map(x=>({...x,score:0,signals:[]})));
+    try {
+      const q=await pool.query(`SELECT u.id unit_id,u.locator,u.text,f.id file_id,f.name file_name,fv.id version_id,ts_rank_cd(u.tsv,websearch_to_tsquery('english',$1)) keyword_score FROM units u JOIN file_versions fv ON fv.id=u.version_id JOIN files f ON f.id=fv.file_id WHERE u.tsv @@ websearch_to_tsquery('english',$1) AND fv.status='ready' AND fv.retracted_at IS NULL AND f.current_version_id=fv.id AND f.deleted_at IS NULL AND f.archived_at IS NULL AND f.searchable=true AND ($2::uuid[] IS NULL OR f.id=ANY($2)) AND ($3::text IS NULL OR f.name ILIKE $3) AND ${access} ORDER BY keyword_score DESC LIMIT $5`,[...params,Math.max(input.limit*4,20)]);
+      candidates.push(q.rows.filter(x=>Number(x.keyword_score)>=0.01).map(x=>({...x,score:0,signals:[]})));
+    } catch (error) {
+      // Older databases may not have applied the full-text migration yet.
+      // Keep search usable with a bounded, permission-filtered text fallback.
+      degraded=true;
+      logger.warn('full_text_search_fallback',{error_name:error instanceof Error?error.name:'Error',error_message:String(error instanceof Error?error.message:error).slice(0,300)});
+      const terms=[...new Set(query.toLowerCase().match(/[a-z0-9]{3,}/g)||[])].slice(0,12).map(term=>`%${term}%`);
+      if(terms.length){
+        const q=await pool.query(`SELECT u.id unit_id,u.locator,u.text,f.id file_id,f.name file_name,fv.id version_id,0::float keyword_score FROM units u JOIN file_versions fv ON fv.id=u.version_id JOIN files f ON f.id=fv.file_id WHERE u.text ILIKE ANY($1::text[]) AND fv.status='ready' AND fv.retracted_at IS NULL AND f.current_version_id=fv.id AND f.deleted_at IS NULL AND f.archived_at IS NULL AND f.searchable=true AND ($2::uuid[] IS NULL OR f.id=ANY($2)) AND ($3::text IS NULL OR f.name ILIKE $3) AND ${access} ORDER BY u.idx LIMIT $5`,[terms,input.fileIds?.length?input.fileIds:null,input.name?`%${input.name}%`:null,input.userId,Math.max(input.limit*4,20)]);
+        candidates.push(q.rows.map(x=>({...x,score:0,signals:[]})));
+      }
+    }
   }
   return {results:reciprocalRankFusion(candidates,input.limit),degraded};
 }

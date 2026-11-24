@@ -4,9 +4,16 @@ import {
   BrowserRouter, Link, Navigate, Route, Routes,
   useLocation, useNavigate, useParams,
 } from 'react-router-dom';
+import { Brand, Dialog, Glyph } from './interface';
+import { request } from './api';
+import { ClassroomInsights, FacultyOverview } from './ClassroomInsights';
+import { StudentDashboard } from './StudyDashboard';
+import { Saara } from './Saara';
+import { RevisionSessionProvider, useRevisionSession } from './RevisionSession';
+import type { ReadingEntry } from './study-data';
 import './style.css';
+import './study-desk.css';
 
-const API = (import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://localhost:3000/api' : `${window.location.origin}/api`)).replace(/\/$/, '');
 
 type Membership = { orgId: string; code: string; name: string; role: 'faculty' | 'student' };
 type User = { id: string; name: string; email: string; accountRole: 'student' | 'professor'; memberships: Membership[] };
@@ -18,30 +25,19 @@ function ingestionLabel(version: any) {
   if (status === 'dead' || status === 'failed') return 'Failed';
   return version?.status || 'Processing';
 }
-type AuthState = { token: string; user: User | null; portal: 'student' | 'professor' };
-
-async function request(path: string, token: string, init: RequestInit = {}) {
-  let response: Response;
-  try {
-    response = await fetch(`${API}${path}`, {
-      ...init,
-      headers: {
-        ...(init.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }),
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...init.headers,
-      },
+function usePendingVersions(files: FileRow[], refresh: (showLoader?: boolean) => void) {
+  useEffect(() => {
+    const pending = files.some(file => {
+      const version = file.versions?.[0];
+      return version && (version.job_status === 'queued' || version.job_status === 'running' || version.status === 'processing');
     });
-  } catch (error) {
-    if (error instanceof TypeError) throw new Error(`Cannot reach the Gurukul-AI API at ${API}. Check that the server is running.`);
-    throw error;
-  }
-  const contentType = response.headers.get('content-type') || '';
-  if (response.status !== 204 && !contentType.includes('application/json'))
-    throw new Error(`The server at ${API} did not return API JSON.`);
-  const data = response.status === 204 ? null : await response.json();
-  if (!response.ok) throw new Error(data?.error?.message || `Request failed (HTTP ${response.status}).`);
-  return data;
+    if (!pending) return;
+    const timer = window.setTimeout(() => refresh(false), 3500);
+    return () => window.clearTimeout(timer);
+  }, [files, refresh]);
 }
+
+type AuthState = { token: string; user: User | null; portal: 'student' | 'professor' };
 
 async function uploadToApi(file: File, token: string, params: Record<string, unknown>, onProgress?: (value:number)=>void) {
   const fallback = async () => {
@@ -73,12 +69,10 @@ async function uploadToApi(file: File, token: string, params: Record<string, unk
 
 // ─── CLASSROOM BANNER COLOURS (cycles) ───────────────────────────────────────
 const BANNER_PALETTES = [
-  { bg: 'linear-gradient(135deg,#35483c 0%,#526552 100%)', accent: '#b7c39e' },
-  { bg: 'linear-gradient(135deg,#713d30 0%,#a15b43 100%)', accent: '#e5b397' },
-  { bg: 'linear-gradient(135deg,#4e5348 0%,#797b65 100%)', accent: '#d0c69e' },
-  { bg: 'linear-gradient(135deg,#7d542d 0%,#a67840 100%)', accent: '#e4c48b' },
-  { bg: 'linear-gradient(135deg,#3c5553 0%,#607977 100%)', accent: '#b2cbc2' },
-  { bg: 'linear-gradient(135deg,#6a4547 0%,#926363 100%)', accent: '#dfb4a9' },
+  { bg: '#29395d', accent: '#c5d4fe' },
+  { bg: '#305446', accent: '#b6dbc4' },
+  { bg: '#68464e', accent: '#f0b7b6' },
+  { bg: '#4b4469', accent: '#d8c6f5' },
 ];
 function palette(id: string) {
   let hash = 0; for (const c of id) hash = (hash * 31 + c.charCodeAt(0)) | 0;
@@ -87,10 +81,26 @@ function palette(id: string) {
 
 // ─── ICONS ────────────────────────────────────────────────────────────────────
 const Icon = {
-  home: '⌂', classroom: '▦', files: '▤', ai: '✳', search: '⌕', dashboard: '▥',
-  trash: '⌫', signout: '↗', upload: '↑', close: '×', send: '↗', back: '←',
-  menu: '☰', plus: '+', check: '✓', eye: '◉', download: '↓', announce: '!',
-  material: '▧', people: '◎', copy: '▢', settings: '⚙',
+  home: <Glyph name="home" />,
+  classroom: <Glyph name="classroom" />,
+  files: <Glyph name="files" />,
+  ai: <Glyph name="ai" />,
+  search: <Glyph name="search" />,
+  dashboard: <Glyph name="dashboard" />,
+  trash: <Glyph name="trash" />,
+  signout: <Glyph name="signout" />,
+  upload: <Glyph name="upload" />,
+  close: <Glyph name="close" />,
+  send: <Glyph name="send" />,
+  back: <Glyph name="back" />,
+  menu: <Glyph name="menu" />,
+  plus: <Glyph name="plus" />,
+  check: <Glyph name="check" />,
+  eye: <Glyph name="eye" />,
+  material: <Glyph name="material" />,
+  people: <Glyph name="people" />,
+  copy: <Glyph name="copy" />,
+  study: <Glyph name="study" />,
 };
 
 // ─── AUTH / LOGIN ─────────────────────────────────────────────────────────────
@@ -114,36 +124,41 @@ function Login({ initialPortal, onLogin }: { initialPortal: 'student' | 'profess
 
   return (
     <main className="gk-login-page">
-      <div className="gk-login-wrap">
-        <div className="gk-login-brand">
-          <div className="gk-brand-logo">G</div>
-          <h1 className="gk-brand-name">Gurukul-AI</h1>
-          <p className="gk-brand-tagline">Your AI-powered classroom, reimagined.</p>
+      <section className="atlas-cover" aria-label="Gurukul-AI academic workspace">
+        <Brand />
+        <div className="atlas-intro">
+          <p className="cover-label">Academic workspace</p>
+          <h1>The study<br/><em>atlas.</em></h1>
+          <p className="cover-summary">Your course materials, classrooms, and study assistant in one place.</p>
         </div>
+        <img className="atlas-art" src="/atlas.webp" alt="" width="1200" height="800" />
+      </section>
+      <section className="gk-login-wrap" aria-labelledby="auth-heading">
         <div className="gk-login-card">
-          <div className="gk-portal-tabs" role="tablist">
-            <button type="button" className={`gk-portal-tab${portal === 'student' ? ' active' : ''}`} onClick={() => selectPortal('student')}>Student</button>
-            <button type="button" className={`gk-portal-tab${portal === 'professor' ? ' active' : ''}`} onClick={() => selectPortal('professor')}>Professor</button>
+          <p className="entry-label"><span />{portal === 'student' ? 'Student access' : 'Professor access'}</p>
+          <h2 className="gk-login-title" id="auth-heading">{mode === 'register' ? 'Create an account' : 'Welcome back.'}</h2>
+          <p className="auth-description">{mode === 'register' ? 'Set up your ' + portal + ' workspace.' : 'Sign in to your academic workspace.'}</p>
+          <div className="gk-portal-tabs" role="group" aria-label="Account type">
+            {(['student','professor'] as const).map(role => <button type="button" key={role} aria-pressed={portal === role} className={'gk-portal-tab' + (portal === role ? ' active' : '')} onClick={() => selectPortal(role)}><Glyph name={role === 'student' ? 'student' : 'classroom'} />{role === 'student' ? 'Student' : 'Professor'}</button>)}
           </div>
-          <h2 className="gk-login-title">{mode === 'register' ? `Create ${portal} account` : 'Sign in'}</h2>
           <form className="gk-login-form" onSubmit={submit}>
             {mode === 'register' && (
               <div className="gk-field">
                 <label htmlFor="reg-name">Full name</label>
-                <input id="reg-name" type="text" value={name} onChange={e => setName(e.target.value)} autoComplete="name" minLength={1} maxLength={100} required />
+                <input id="reg-name" placeholder="Your full name" type="text" value={name} onChange={e => setName(e.target.value)} autoComplete="name" minLength={1} maxLength={100} required />
               </div>
             )}
             <div className="gk-field">
-              <label htmlFor="login-email">Email</label>
-              <input id="login-email" type="email" value={email} onChange={e => setEmail(e.target.value)} autoComplete="email" maxLength={254} required />
+              <label htmlFor="login-email">Email address</label>
+              <input id="login-email" placeholder="you@university.edu" type="email" value={email} onChange={e => setEmail(e.target.value)} autoComplete="email" maxLength={254} required />
             </div>
             <div className="gk-field">
               <label htmlFor="login-password">Password</label>
-              <input id="login-password" type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete={mode === 'register' ? 'new-password' : 'current-password'} minLength={mode === 'register' ? 8 : undefined} required />
+              <input id="login-password" placeholder={mode === 'register' ? 'At least 8 characters' : 'Enter your password'} type="password" value={password} onChange={e => setPassword(e.target.value)} autoComplete={mode === 'register' ? 'new-password' : 'current-password'} minLength={mode === 'register' ? 8 : undefined} required />
             </div>
             {error && <div className="gk-error" role="alert">{error}</div>}
             <button className="gk-btn gk-btn-primary" disabled={busy}>
-              {busy ? 'Please wait…' : mode === 'register' ? 'Create account' : 'Sign in'}
+              {busy ? 'Please wait…' : mode === 'register' ? 'Create account' : 'Sign in'}{Icon.send}
             </button>
           </form>
           <p className="gk-login-switch">
@@ -153,7 +168,7 @@ function Login({ initialPortal, onLogin }: { initialPortal: 'student' | 'profess
             </button>
           </p>
         </div>
-      </div>
+      </section>
     </main>
   );
 }
@@ -164,7 +179,41 @@ function App() {
   const [auth, setAuth] = useState<AuthState>({ token: localStorage.getItem('token') || '', user: null, portal: storedPortal });
   const [checking, setChecking] = useState(Boolean(localStorage.getItem('token')));
   const location = useLocation(); const navigate = useNavigate();
+  const [reading, setReading] = useState<ReadingEntry[]>([]);
+  const rememberReading = useCallback((entry: ReadingEntry) => {
+    setReading(list => {
+      if (list[0]?.id === entry.id && list[0]?.locator === entry.locator) return list;
+      return [entry, ...list.filter(previous => previous.id !== entry.id)].slice(0,5);
+    });
+  }, []);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const menuButton = useRef<HTMLButtonElement>(null);
+  const sidebar = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (!sidebarOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    sidebar.current?.querySelector<HTMLElement>('a,button')?.focus();
+    const handleKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setSidebarOpen(false);
+      if (event.key !== 'Tab') return;
+      const controls = sidebar.current?.querySelectorAll<HTMLElement>('a,button');
+      if (!controls?.length) return;
+      const first=controls[0], last=controls[controls.length-1];
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    const wide = window.matchMedia('(min-width:901px)');
+    const closeWide = () => { if(wide.matches) setSidebarOpen(false); };
+    wide.addEventListener('change', closeWide);
+    window.addEventListener('keydown',handleKey);
+    return () => {
+      document.body.style.overflow = previous;
+      wide.removeEventListener('change', closeWide);
+      window.removeEventListener('keydown', handleKey);
+      menuButton.current?.focus();
+    };
+  }, [sidebarOpen]);
 
   useEffect(() => {
     if (!auth.token) { setChecking(false); return; }
@@ -179,12 +228,21 @@ function App() {
     }).finally(() => setChecking(false));
   }, [auth.token]);
 
+  const addMembership = (membership: Membership) => {
+    setAuth(previous => {
+      if (!previous.user || previous.user.memberships.some(m => m.orgId === membership.orgId)) return previous;
+      return { ...previous, user: { ...previous.user, memberships: [...previous.user.memberships, membership] } };
+    });
+  };
+
   const login = (token: string, user: User, portal: 'student' | 'professor') => {
+    setReading([]);
     localStorage.setItem('token', token); localStorage.setItem('portal', portal);
     setAuth({ token, user, portal });
     navigate(portal === 'professor' ? '/professor' : '/student');
   };
   const logout = () => {
+    setReading([]);
     localStorage.removeItem('token'); localStorage.removeItem('portal');
     setAuth({ token: '', user: null, portal: 'student' });
     navigate('/student/login');
@@ -197,10 +255,10 @@ function App() {
   }
 
   const portalCourses = auth.user.memberships.filter(m => auth.portal === 'professor' ? m.role === 'faculty' : m.role === 'student');
-  const navLinks: { label: string; href: string; icon: string }[] =
+  const navLinks: { label: string; href: string; icon: React.ReactNode }[] =
     auth.portal === 'professor'
       ? [{ label: 'Home', href: '/professor', icon: Icon.home }, { label: 'My Files', href: '/spaces/personal', icon: Icon.files }, { label: 'AI Assistant', href: '/assistant', icon: Icon.ai }, { label: 'Search', href: '/search', icon: Icon.search }, { label: 'Dashboard', href: '/dashboard', icon: Icon.dashboard }, { label: 'Trash', href: '/trash', icon: Icon.trash }]
-      : [{ label: 'Home', href: '/student', icon: Icon.home }, { label: 'My Files', href: '/spaces/personal', icon: Icon.files }, { label: 'AI Assistant', href: '/assistant', icon: Icon.ai }, { label: 'Search', href: '/search', icon: Icon.search }, { label: 'Study', href: '/study', icon: '✎' }, { label: 'Dashboard', href: '/dashboard', icon: Icon.dashboard }];
+      : [{ label: 'Home', href: '/student', icon: Icon.home }, { label: 'My Files', href: '/spaces/personal', icon: Icon.files }, { label: 'AI Assistant', href: '/assistant', icon: Icon.ai }, { label: 'Search', href: '/search', icon: Icon.search }, { label: 'Study', href: '/study', icon: Icon.study }, { label: 'Dashboard', href: '/dashboard', icon: Icon.dashboard }];
 
   const isActive = (href: string) => location.pathname === href || (href !== '/professor' && href !== '/student' && location.pathname.startsWith(href));
 
@@ -210,17 +268,16 @@ function App() {
       {sidebarOpen && <div className="gk-overlay" onClick={() => setSidebarOpen(false)} />}
 
       {/* Sidebar */}
-      <aside className={`gk-sidebar${sidebarOpen ? ' open' : ''}`}>
-        <div className="gk-sidebar-header">
+      <aside id="workspace-menu" ref={sidebar} role={sidebarOpen ? "dialog" : undefined} aria-modal={sidebarOpen || undefined} aria-label="Workspace navigation" className={`gk-sidebar${sidebarOpen ? ' open' : ''}`}>
+        <div className="gk-sidebar-header"><button className="drawer-close gk-icon-btn" aria-label="Close navigation" onClick={() => setSidebarOpen(false)}>{Icon.close}</button>
           <Link className="gk-sidebar-brand" to={auth.portal === 'professor' ? '/professor' : '/student'} onClick={() => setSidebarOpen(false)}>
-            <span className="gk-sidebar-logo">G</span>
-            <span>Gurukul-AI</span>
+            <Brand />
           </Link>
         </div>
 
-        <nav className="gk-sidebar-nav">
+        <nav aria-label="Workspace" className="gk-sidebar-nav">
           {navLinks.map(({ label, href, icon }) => (
-            <Link key={href} to={href} className={`gk-nav-link${isActive(href) ? ' active' : ''}`} onClick={() => setSidebarOpen(false)}>
+            <Link key={href} to={href} aria-current={isActive(href) ? "page" : undefined} className={`gk-nav-link${isActive(href) ? ' active' : ''}`} onClick={() => setSidebarOpen(false)}>
               <span className="gk-nav-icon">{icon}</span>
               {label}
             </Link>
@@ -269,43 +326,47 @@ function App() {
       </aside>
 
       {/* Main */}
-      <div className="gk-main">
+      <main className="gk-main" inert={sidebarOpen}>
         {/* Top bar (mobile) */}
         <header className="gk-topbar">
-          <button className="gk-topbar-menu" onClick={() => setSidebarOpen(!sidebarOpen)}>{Icon.menu}</button>
-          <Link className="gk-topbar-brand" to={auth.portal === 'professor' ? '/professor' : '/student'}>Gurukul-AI</Link>
+          <button ref={menuButton} aria-label="Open navigation" aria-controls="workspace-menu" aria-expanded={sidebarOpen} className="gk-topbar-menu" onClick={() => setSidebarOpen(!sidebarOpen)}>{Icon.menu}</button>
+          <Link className="gk-topbar-brand" to={auth.portal === 'professor' ? '/professor' : '/student'}><Brand /></Link>
+          <span className="workspace-name">{auth.portal} workspace</span>
         </header>
 
-        <Routes>
+        <RevisionSessionProvider key={auth.user.id}><Routes>
           <Route path="/" element={<Navigate to={auth.portal === 'professor' ? '/professor' : '/student'} replace />} />
-          <Route path="/student" element={<PortalPage user={auth.user} portal="student" token={auth.token} />} />
-          <Route path="/professor" element={auth.portal === 'professor' ? <PortalPage user={auth.user} portal="professor" token={auth.token} /> : <Navigate to="/student" replace />} />
+          <Route path="/student" element={<PortalPage history={reading} onMembership={addMembership} user={auth.user} portal="student" token={auth.token} />} />
+          <Route path="/professor" element={auth.portal === 'professor' ? <PortalPage history={reading} onMembership={addMembership} user={auth.user} portal="professor" token={auth.token} /> : <Navigate to="/student" replace />} />
           <Route path="/classroom/:id" element={<ClassroomPage token={auth.token} user={auth.user} portal={auth.portal} />} />
           <Route path="/spaces/:space" element={<FilesPage token={auth.token} user={auth.user} />} />
-          <Route path="/files/:id" element={<FilePage token={auth.token} />} />
+          <Route path="/files/:id" element={<FilePage token={auth.token} onRead={auth.portal === 'student' ? rememberReading : undefined} />} />
           <Route path="/search" element={<SearchPage token={auth.token} />} />
           <Route path="/assistant" element={<AssistantPage token={auth.token} />} />
           <Route path="/study" element={<StudyPage token={auth.token} />} />
-          <Route path="/dashboard" element={<DashboardPage token={auth.token} isProfessor={auth.user.accountRole === 'professor'} />} />
+          <Route path="/dashboard" element={auth.portal === 'professor' && auth.user.accountRole === 'professor'
+            ? <div className="gk-page"><FacultyOverview token={auth.token} courses={auth.user.memberships}/><StorageDashboard token={auth.token} isProfessor /></div>
+            : <PortalPage history={reading} showStorage onMembership={addMembership} user={auth.user} portal="student" token={auth.token} />} />
           <Route path="/trash" element={<TrashPage token={auth.token} />} />
           <Route path="*" element={<Navigate to={auth.portal === 'professor' ? '/professor' : '/student'} replace />} />
-        </Routes>
-      </div>
+        </Routes></RevisionSessionProvider>
+      </main>
     </div>
   );
 }
 
 // ─── PORTAL PAGE (Home) ───────────────────────────────────────────────────────
-function PortalPage({ user, portal, token }: { user: User; portal: 'student' | 'professor'; token: string }) {
+function PortalPage({ user, portal, token, onMembership, history, showStorage=false }: { history:ReadingEntry[]; showStorage?:boolean; onMembership: (membership: Membership) => void; user: User; portal: 'student' | 'professor'; token: string }) {
   const [classrooms, setClassrooms] = useState<any[]>([]);
   const [className, setClassName] = useState(''), [classCode, setClassCode] = useState(''), [description, setDescription] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [busy, setBusy] = useState(false), [error, setError] = useState(''), [notice, setNotice] = useState('');
   const [showCreate, setShowCreate] = useState(false), [showJoin, setShowJoin] = useState(false);
-  const navigate = useNavigate();
+  const [loadingClasses, setLoadingClasses] = useState(true);
+  const [classError, setClassError] = useState('');
 
   const refresh = useCallback(() =>
-    request('/classrooms', token).then(d => setClassrooms(d.classrooms || [])).catch(e => setError(e.message)), [token]);
+    request('/classrooms', token).then(d => { setClassrooms(d.classrooms || []); setClassError(''); }).catch(e => setClassError(e.message)).finally(() => setLoadingClasses(false)), [token]);
   useEffect(() => { refresh(); }, [refresh]);
 
   const courses = classrooms.filter(c => portal === 'professor' ? c.role === 'faculty' : c.role === 'student');
@@ -313,7 +374,8 @@ function PortalPage({ user, portal, token }: { user: User; portal: 'student' | '
   async function createClass(e: React.FormEvent) {
     e.preventDefault(); setBusy(true); setError('');
     try {
-      await request('/classrooms', token, { method: 'POST', body: JSON.stringify({ name: className, code: classCode, description }) });
+      const { classroom } = await request('/classrooms', token, { method: 'POST', body: JSON.stringify({ name: className, code: classCode, description }) });
+      onMembership({ orgId: classroom.id, name: classroom.name, code: classroom.code, role: 'faculty' });
       setShowCreate(false); setClassName(''); setClassCode(''); setDescription('');
       setNotice('Classroom created!'); refresh();
     } catch (err) { setError(err instanceof Error ? err.message : 'Could not create classroom.'); }
@@ -324,6 +386,7 @@ function PortalPage({ user, portal, token }: { user: User; portal: 'student' | '
     e.preventDefault(); setBusy(true); setError('');
     try {
       const d = await request('/classrooms/join', token, { method: 'POST', body: JSON.stringify({ joinCode }) });
+      onMembership({ orgId: d.classroom.id, name: d.classroom.name, code: d.classroom.code, role: 'student' });
       setShowJoin(false); setJoinCode('');
       setNotice(`Joined ${d.classroom?.name || 'classroom'}!`); refresh();
     } catch (err) { setError(err instanceof Error ? err.message : 'Could not join classroom.'); }
@@ -332,31 +395,24 @@ function PortalPage({ user, portal, token }: { user: User; portal: 'student' | '
 
   return (
     <div className="gk-page gk-portal-page">
-      <div className="gk-portal-header">
+      {portal === 'student' ? <StudentDashboard token={token} name={user.name} courses={courses} loading={loadingClasses} classError={classError} history={history} join={() => {setError('');setShowJoin(true);}}/> : <div className="gk-portal-header">
         <div>
-          <h1>Welcome, {user.name.split(' ')[0]} 👋</h1>
-          <p>{portal === 'professor' ? 'Manage your classrooms and course materials.' : 'Your enrolled classrooms and study materials.'}</p>
+          <p className="cover-label">Faculty desk</p><h1>Welcome, {user.name.split(' ')[0]}.</h1>
+          <p>Manage your classrooms and course materials.</p>
         </div>
         <div className="gk-portal-actions">
-          {portal === 'professor'
-            ? <button className="gk-btn gk-btn-primary" onClick={() => setShowCreate(true)}>{Icon.plus} New Classroom</button>
-            : <button className="gk-btn gk-btn-primary" onClick={() => setShowJoin(true)}>{Icon.plus} Join Class</button>
-          }
+          <button className="gk-btn gk-btn-primary" onClick={() => setShowCreate(true)}>{Icon.plus} New Classroom</button>
           <Link className="gk-btn gk-btn-secondary" to="/assistant">{Icon.ai} AI Assistant</Link>
         </div>
-      </div>
+      </div>}
 
-      {error && <div className="gk-error gk-error-bar" role="alert">{error} <button className="gk-text-btn" onClick={() => setError('')}>{Icon.close}</button></div>}
-      {notice && <div className="gk-notice gk-notice-bar">{notice} <button className="gk-text-btn" onClick={() => setNotice('')}>{Icon.close}</button></div>}
+      {portal==='professor' && classError && <p className="gk-error">{classError}</p>}
+      {error && <div className="gk-error gk-error-bar" role="alert">{error} <button aria-label="Dismiss error" className="gk-text-btn" onClick={() => setError('')}>{Icon.close}</button></div>}
+      {notice && <div role="status" className="gk-notice gk-notice-bar">{notice} <button aria-label="Dismiss notice" className="gk-text-btn" onClick={() => setNotice('')}>{Icon.close}</button></div>}
 
       {/* Create classroom modal */}
       {showCreate && (
-        <div className="gk-modal-backdrop" onClick={() => setShowCreate(false)}>
-          <div className="gk-modal" onClick={e => e.stopPropagation()}>
-            <div className="gk-modal-header">
-              <h2>Create a classroom</h2>
-              <button className="gk-icon-btn" onClick={() => setShowCreate(false)}>{Icon.close}</button>
-            </div>
+        <Dialog title="Create a classroom" onDismiss={() => setShowCreate(false)}>
             <form className="gk-modal-form" onSubmit={createClass}>
               <div className="gk-field"><label>Class name *<input value={className} onChange={e => setClassName(e.target.value)} placeholder="e.g. Introduction to Computing" maxLength={120} required /></label></div>
               <div className="gk-field"><label>Class code (optional)<input value={classCode} onChange={e => setClassCode(e.target.value.toUpperCase())} placeholder="e.g. CS101" maxLength={24} /></label></div>
@@ -365,19 +421,14 @@ function PortalPage({ user, portal, token }: { user: User; portal: 'student' | '
                 <button type="button" className="gk-btn gk-btn-ghost" onClick={() => setShowCreate(false)}>Cancel</button>
                 <button className="gk-btn gk-btn-primary" disabled={busy}>{busy ? 'Creating…' : 'Create'}</button>
               </div>
+              {error && <p className="gk-error" role="alert">{error}</p>}
             </form>
-          </div>
-        </div>
+        </Dialog>
       )}
 
       {/* Join classroom modal */}
       {showJoin && (
-        <div className="gk-modal-backdrop" onClick={() => setShowJoin(false)}>
-          <div className="gk-modal" onClick={e => e.stopPropagation()}>
-            <div className="gk-modal-header">
-              <h2>Join a classroom</h2>
-              <button className="gk-icon-btn" onClick={() => setShowJoin(false)}>{Icon.close}</button>
-            </div>
+        <Dialog title="Join a classroom" onDismiss={() => setShowJoin(false)}>
             <form className="gk-modal-form" onSubmit={joinClass}>
               <div className="gk-field"><label>Classroom join code<input value={joinCode} onChange={e => setJoinCode(e.target.value.toUpperCase())} placeholder="10-character code from your professor" maxLength={10} minLength={10} autoCapitalize="characters" required /></label></div>
               <p className="gk-hint">Ask your professor for the join code shown on their classroom page.</p>
@@ -385,18 +436,18 @@ function PortalPage({ user, portal, token }: { user: User; portal: 'student' | '
                 <button type="button" className="gk-btn gk-btn-ghost" onClick={() => setShowJoin(false)}>Cancel</button>
                 <button className="gk-btn gk-btn-primary" disabled={busy || joinCode.trim().length !== 10}>{busy ? 'Joining…' : 'Join'}</button>
               </div>
+              {error && <p className="gk-error" role="alert">{error}</p>}
             </form>
-          </div>
-        </div>
+        </Dialog>
       )}
 
-      {/* Classroom grid */}
-      {courses.length === 0
+      {portal === 'professor' && <><div className="section-rule"><h2>Your classrooms</h2>{!loadingClasses && <span>{courses.length}</span>}</div>
+      {loadingClasses ? <div className="gk-loading-inline" role="status">Loading classrooms…</div> : courses.length === 0
         ? (
           <div className="gk-empty-state">
             <div className="gk-empty-icon">{Icon.classroom}</div>
-            <h2>{portal === 'professor' ? 'No classrooms yet' : 'Not enrolled in any class'}</h2>
-            <p>{portal === 'professor' ? 'Create your first classroom to get a join code for students.' : 'Enter a join code from your professor to enroll.'}</p>
+            <h2>No classrooms yet</h2>
+            <p>Create your first classroom to get a join code for students.</p>
           </div>
         )
         : (
@@ -404,7 +455,7 @@ function PortalPage({ user, portal, token }: { user: User; portal: 'student' | '
             {courses.map(c => {
               const p = palette(c.id);
               return (
-                <div key={c.id} className="gk-classroom-card" onClick={() => navigate(`/classroom/${c.id}`)}>
+                <Link key={c.id} className="gk-classroom-card" to={`/classroom/${c.id}`}>
                   <div className="gk-card-banner" style={{ background: p.bg }}>
                     <div className="gk-card-banner-title">{c.name}</div>
                     <div className="gk-card-banner-code">{c.code}</div>
@@ -412,18 +463,16 @@ function PortalPage({ user, portal, token }: { user: User; portal: 'student' | '
                   <div className="gk-card-body">
                     {c.description && <p className="gk-card-desc">{c.description}</p>}
                     <div className="gk-card-meta">
-                      {portal === 'professor'
-                        ? <><span>{Icon.people} {c.student_count} students</span><span title="Join code" className="gk-join-code">{Icon.copy} {c.join_code}</span></>
-                        : <span>Open class →</span>
-                      }
+                      <span>{Icon.people} {c.student_count} students</span><span title="Join code" className="gk-join-code">{Icon.copy} {c.join_code}</span>
                     </div>
                   </div>
-                </div>
+                </Link>
               );
             })}
           </div>
         )
-      }
+      }</>}
+      {showStorage && <details className="storage-disclosure"><summary>Storage and file statistics</summary><StorageDashboard token={token} isProfessor={false}/></details>}
     </div>
   );
 }
@@ -449,15 +498,17 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
 
   const membership = user.memberships.find(m => m.orgId === id);
   const isFaculty = membership?.role === 'faculty' || portal === 'professor';
+  const canSeeInsights = user.accountRole === 'professor' && membership?.role === 'faculty';
   const filteredClassmates = members.filter(person => person.name.toLowerCase().includes(shareSearch.trim().toLowerCase()));
 
-  const refreshFiles = useCallback(() => {
-    setBusy(true);
+  const refreshFiles = useCallback((showLoader = true) => {
+    if (showLoader) setBusy(true);
     request(`/files?scope=org:${id}&includeArchived=false`, token)
       .then(d => setFiles(d.files || []))
       .catch(e => setError(e.message))
       .finally(() => setBusy(false));
   }, [id, token]);
+  usePendingVersions(files, refreshFiles);
 
   useEffect(() => {
     setShareWith([]);
@@ -507,26 +558,26 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
             <p className="gk-class-subtitle">{classroom?.code}{classroom?.description ? ` · ${classroom.description}` : ''}</p>
           </div>
           {isFaculty && classroom?.join_code && (
-            <div className="gk-join-code-badge" onClick={copyCode} title="Click to copy join code">
+            <button type="button" className="gk-join-code-badge" onClick={copyCode} title="Click to copy join code">
               <span className="gk-join-label">Join code</span>
               <span className="gk-join-value">{classroom.join_code}</span>
               <span className="gk-join-copy">{copied ? Icon.check : Icon.copy}</span>
-            </div>
+            </button>
           )}
         </div>
       </div>
 
       {/* Tabs */}
       <div className="gk-class-tabs">
-        {(['stream', 'materials', 'members', ...(isFaculty?['insights' as const]:[])] as const).map(t => (
-          <button key={t} className={`gk-class-tab${tab === t ? ' active' : ''}`} onClick={() => setTab(t)}>
-            {t === 'stream' ? `${Icon.announce} Stream` : t === 'materials' ? `${Icon.material} Materials` : t === 'members' ? `${Icon.people} Members` : 'Insights'}
+        {(['stream', 'materials', 'members', ...(canSeeInsights?['insights' as const]:[])] as const).map(t => (
+          <button key={t} aria-pressed={tab===t} className={`gk-class-tab${tab === t ? ' active' : ''}`} onClick={() => setTab(t)}>
+            {t === 'stream' ? 'Stream' : t === 'materials' ? 'Materials' : t === 'members' ? 'Members' : 'Insights'}
           </button>
         ))}
       </div>
 
-      {error && <div className="gk-error gk-error-bar" role="alert" style={{ margin: '0 24px 0' }}>{error} <button className="gk-text-btn" onClick={() => setError('')}>{Icon.close}</button></div>}
-      {uploadMsg && <div className="gk-notice gk-notice-bar" style={{ margin: '0 24px 12px' }}>{uploadMsg}</div>}
+      {error && <div className="gk-error gk-error-bar" role="alert" style={{ margin: '0 24px 0' }}>{error} <button aria-label="Dismiss error" className="gk-text-btn" onClick={() => setError('')}>{Icon.close}</button></div>}
+      {uploadMsg && <div role="status" className="gk-notice gk-notice-bar" style={{ margin: '0 24px 12px' }}>{uploadMsg}</div>}
       {uploadProgress!==null&&<div style={{margin:'0 24px 12px'}}><progress value={uploadProgress} max={100} /> {uploadProgress}%</div>}
 
       <div className="gk-class-body">
@@ -538,10 +589,10 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
               {isFaculty && classroom?.join_code && (
                 <div className="gk-info-card">
                   <div className="gk-info-card-title">Class join code</div>
-                  <div className="gk-info-code" onClick={copyCode} title="Click to copy">
+                  <button type="button" className="gk-info-code" onClick={copyCode} title="Click to copy">
                     {classroom.join_code}
-                    <span>{copied ? ' Copied!' : ` ${Icon.copy}`}</span>
-                  </div>
+                    <span>{copied ? ' Copied!' : Icon.copy}</span>
+                  </button>
                   <p className="gk-hint">Share this with students to let them join.</p>
                 </div>
               )}
@@ -561,14 +612,14 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
               {/* Upload / Post panel */}
               <div className="gk-post-panel">
                 <div className="gk-post-panel-header">
-                  <span>{isFaculty ? `${Icon.upload} Share materials or announce` : `${Icon.upload} Share a file`}</span>
+                  <span>{Icon.upload} Share a file</span>
                 </div>
                 <form onSubmit={upload} className="gk-post-form">
                   {!selected
                     ? (
                       <label className="gk-file-drop" htmlFor="class-file-input">
                         <input id="class-file-input" type="file" accept=".docx,.pptx,.pdf" multiple ref={fileInputRef}
-                          onChange={e => {const files=Array.from(e.target.files||[]);setSelectedFiles(files);setSelected(files[0]||null);}} style={{ display: 'none' }} />
+                          onChange={e => {const files=Array.from(e.target.files||[]);setSelectedFiles(files);setSelected(files[0]||null);}} className="file-control" />
                         <span className="gk-file-drop-icon">{Icon.upload}</span>
                         <span>Click to upload a PDF, PPTX, or DOCX</span>
                       </label>
@@ -576,7 +627,7 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
                     : (
                       <div className="gk-selected-file">
                         <span>{Icon.material} {selectedFiles.length>1?`${selected.name} + ${selectedFiles.length-1} more`:selected.name}</span>
-                        <button type="button" className="gk-icon-btn" onClick={() => { setSelected(null);setSelectedFiles([]); if (fileInputRef.current) fileInputRef.current.value = ''; }}>{Icon.close}</button>
+                        <button type="button" aria-label="Remove selected files" className="gk-icon-btn" onClick={() => { setSelected(null);setSelectedFiles([]); if (fileInputRef.current) fileInputRef.current.value = ''; }}>{Icon.close}</button>
                       </div>
                     )
                   }
@@ -642,7 +693,7 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
               <h2>Class Materials</h2>
               <label className="gk-btn gk-btn-primary">
                 {Icon.upload} Upload
-                <input type="file" accept=".docx,.pptx,.pdf" multiple style={{ display: 'none' }} onChange={async e => {
+                <input type="file" accept=".docx,.pptx,.pdf" multiple className="file-control" onChange={async e => {
                   const files = Array.from(e.target.files||[]); if (!files.length) return;
                   setUploading(true); setError(''); setUploadMsg('');
                   try {
@@ -664,7 +715,7 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
                       const latest = f.versions?.[0];
                       return (
                         <Link key={f.id} to={`/files/${f.id}`} className="gk-material-card">
-                          <div className="gk-material-icon">{f.format === 'pdf' ? '📄' : f.format === 'pptx' ? '📊' : '📝'}</div>
+                          <div className="gk-material-icon">{Icon.material}</div>
                           <div className="gk-material-info">
                             <strong>{f.name}</strong>
                             <small>{f.format.toUpperCase()} · {latest ? `${(Number(latest.size_bytes) / 1024).toFixed(1)} KB` : '—'} · <span className={`gk-badge ${latest?.status}`}>{ingestionLabel(latest)}</span></small>
@@ -710,25 +761,17 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
             </div>
           </div>
         )}
-        {tab === 'insights' && isFaculty && <ClassroomInsights token={token} classroomId={id} />}
+        {tab === 'insights' && canSeeInsights && <ClassroomInsights key={id} token={token} classroomId={id} />}
       </div>
     </div>
   );
-}
-
-function ClassroomInsights({token,classroomId}:{token:string;classroomId:string}){
-  const [data,setData]=useState<any>(null),[visible,setVisible]=useState(false),[error,setError]=useState(''),ref=useRef<HTMLDivElement|null>(null);
-  useEffect(()=>{if(!ref.current)return;const observer=new IntersectionObserver(entries=>setVisible(entries.some(e=>e.isIntersecting)));observer.observe(ref.current);return()=>observer.disconnect();},[]);
-  useEffect(()=>{if(!visible)return;const load=()=>request(`/classrooms/${classroomId}/analytics`,token).then(setData).catch(e=>setError(e.message));load();const timer=setInterval(load,10000);return()=>clearInterval(timer);},[visible,classroomId,token]);
-  const max=Math.max(1,...(data?.activity||[]).map((x:any)=>Number(x.count)));
-  return <div ref={ref} className="gk-class-members"><h2>Class insights</h2><p className="gk-hint">Topics are shown only when enough distinct students ask about them. No user identities or raw queries appear here.</p>{error&&<p className="gk-error">{error}</p>}{!data?<p className="gk-hint">Loading classroom insights…</p>:<><p>{data.message}</p><h3>Activity · last 30 days</h3><div style={{display:'flex',alignItems:'end',gap:4,height:120,overflowX:'auto'}}>{data.activity.map((d:any)=><div key={d.day} title={`${d.day}: ${d.count}`} style={{minWidth:12,height:`${Math.max(5,Number(d.count)/max*100)}%`,background:'#6d7b61',borderRadius:4}} />)}</div><h3>Most cited materials</h3>{data.mostCitedFiles.map((x:any)=><p key={x.file_id}>{x.file_name} · {x.citations} citations</p>)}<h3>Most cited sections</h3>{data.mostCitedUnits.map((x:any)=><p key={x.unit_id}>{x.file_name} · {x.locator} · {x.citations}</p>)}<h3>Top topics</h3>{data.topicsWithheld?<p>Topic data is withheld for privacy.</p>:data.topics.map((x:any)=><span className="gk-badge" key={x.term} style={{margin:4}}>{x.term} · {x.count}</span>)}</>}</div>;
 }
 
 function StreamPost({ file, latest, classroomId }: { file: FileRow; latest: any; classroomId: string }) {
   const isReady = latest?.status === 'ready';
   return (
     <div className="gk-stream-post">
-      <div className="gk-post-icon">{file.format === 'pdf' ? '📄' : file.format === 'pptx' ? '📊' : '📝'}</div>
+      <div className="gk-post-icon">{Icon.material}</div>
       <div className="gk-post-content">
         <div className="gk-post-meta">
           <span className="gk-post-type">{file.format.toUpperCase()} · {file.visibility === 'classroom' ? 'Everyone' : 'Selected students'}</span>
@@ -775,11 +818,12 @@ function FilesPage({ token, user }: { token: string; user: User }) {
     setShareSearch('');
   }, [space, membership?.role]);
 
-  const refresh = useCallback(() => {
-    setBusy(true);
+  const refresh = useCallback((showLoader = true) => {
+    if (showLoader) setBusy(true);
     request(`/files?scope=${encodeURIComponent(scope)}&includeArchived=${showArchived}`, token)
       .then(d => setFiles(d.files || [])).catch(e => setError(e.message)).finally(() => setBusy(false));
   }, [scope, showArchived, token]);
+  usePendingVersions(files, refresh);
   useEffect(() => { refresh(); }, [refresh]);
 
   async function upload(e: React.FormEvent) {
@@ -806,7 +850,7 @@ function FilesPage({ token, user }: { token: string; user: User }) {
         {canUpload && (
           <label className="gk-btn gk-btn-primary">
             {Icon.upload} Upload file
-                <input type="file" accept=".docx,.pptx,.pdf" multiple style={{ display: 'none' }} onChange={e => {const files=Array.from(e.target.files||[]);setSelectedFiles(files);setSelected(files[0]||null);}} />
+                <input type="file" accept=".docx,.pptx,.pdf" multiple className="file-control" onChange={e => {const files=Array.from(e.target.files||[]);setSelectedFiles(files);setSelected(files[0]||null);}} />
           </label>
         )}
       </div>
@@ -815,7 +859,7 @@ function FilesPage({ token, user }: { token: string; user: User }) {
         <form className="gk-upload-form" onSubmit={upload}>
           <div className="gk-upload-file-row">
             <span>{Icon.material} {selectedFiles.length>1?`${selected.name} + ${selectedFiles.length-1} more`:selected.name}</span>
-            <button type="button" className="gk-icon-btn" onClick={() => setSelected(null)}>{Icon.close}</button>
+            <button type="button" aria-label="Remove selected files" className="gk-icon-btn" onClick={() => setSelected(null)}>{Icon.close}</button>
           </div>
           {space !== 'personal' && membership?.role === 'student' && (
             <div className="gk-share-controls">
@@ -853,15 +897,15 @@ function FilesPage({ token, user }: { token: string; user: User }) {
         </form>
       )}
 
-      {message && <div className="gk-notice gk-notice-bar">{message}</div>}
+      {message && <div role="status" className="gk-notice gk-notice-bar">{message}</div>}
       {uploadProgress!==null&&<div style={{margin:'8px 0'}}><progress value={uploadProgress} max={100} /> {uploadProgress}%</div>}
-      {error && <p className="gk-error">{error} <button className="gk-text-btn" onClick={refresh}>Retry</button></p>}
+      {error && <p className="gk-error">{error} <button className="gk-text-btn" onClick={() => refresh()}>Retry</button></p>}
 
       <label className="gk-toggle">
         <input type="checkbox" checked={showArchived} onChange={e => setShowArchived(e.target.checked)} /> Show archived
       </label>
 
-      <div className="gk-table-wrap">
+      <div className="gk-table-wrap file-catalog">
         <table>
           <thead><tr><th>Name</th><th>Format</th><th>Size</th><th>Versions</th><th>Status</th><th></th></tr></thead>
           <tbody>
@@ -871,12 +915,12 @@ function FilesPage({ token, user }: { token: string; user: User }) {
                 ? files.map(f => {
                   const latest = f.versions?.[0];
                   return (
-                    <tr key={f.id}>
+                    <tr className="catalog-entry" key={f.id}>
                       <td><Link to={`/files/${f.id}`} className="gk-file-link">{f.name}</Link></td>
-                      <td><span className="gk-format-badge">{f.format}</span></td>
-                      <td className="numeric">{latest ? `${(Number(latest.size_bytes) / 1024).toFixed(1)} KB` : '—'}</td>
-                      <td className="numeric">{f.versions?.length || 0}</td>
-                      <td><span className={`gk-badge ${latest?.status}`}>{ingestionLabel(latest)}</span></td>
+                      <td data-field="Format"><span className="gk-format-badge">{f.format}</span></td>
+                      <td data-field="Size" className="numeric">{latest ? `${(Number(latest.size_bytes) / 1024).toFixed(1)} KB` : '—'}</td>
+                      <td data-field="Versions" className="numeric">{f.versions?.length || 0}</td>
+                      <td data-field="Status"><span className={`gk-badge ${latest?.status}`}>{ingestionLabel(latest)}</span></td>
                       <td><Link to={`/files/${f.id}`} className="gk-btn gk-btn-ghost gk-btn-sm">{Icon.eye} View</Link></td>
                     </tr>
                   );
@@ -891,8 +935,17 @@ function FilesPage({ token, user }: { token: string; user: User }) {
 }
 
 function QuizViewer({ token, fileId, quiz }: { token:string; fileId:string; quiz:any }) {
+  const {forgetQuiz} = useRevisionSession();
   const [answers,setAnswers]=useState<Record<number,number>>({}),[result,setResult]=useState<any>(null),[error,setError]=useState(''),[busy,setBusy]=useState(false);
-  async function submit(e:React.FormEvent){e.preventDefault();setBusy(true);setError('');try{setResult(await request(`/quizzes/${fileId}/attempts`,token,{method:'POST',body:JSON.stringify({answers:Object.entries(answers).map(([questionIndex,selectedIndex])=>({questionIndex:Number(questionIndex),selectedIndex}))})}));}catch(err){setError(err instanceof Error?err.message:'Could not submit quiz.');}finally{setBusy(false);}}
+  async function submit(e:React.FormEvent) {
+    e.preventDefault(); setBusy(true); setError('');
+    try {
+      const selections = Object.entries(answers).map(([questionIndex,selectedIndex])=>({questionIndex:Number(questionIndex),selectedIndex}));
+      setResult(await request(`/quizzes/${fileId}/attempts`,token,{method:'POST',body:JSON.stringify({answers:selections})}));
+      forgetQuiz(fileId);
+    } catch(err) { setError(err instanceof Error ? err.message : 'Could not submit quiz.'); }
+    finally { setBusy(false); }
+  }
   return <form onSubmit={submit}><h2>{quiz.title||'Study quiz'}</h2>{(quiz.questions||[]).map((question:any,index:number)=><section className="gk-stat-card" style={{marginBottom:12}} key={index}><strong>{index+1}. {question.question}</strong>{question.options.map((option:string,choice:number)=><label key={choice} style={{display:'block',padding:'6px 0'}}><input type="radio" name={`q-${index}`} checked={answers[index]===choice} disabled={!!result} onChange={()=>setAnswers(a=>({...a,[index]:choice}))}/> {option}</label>)}{result&&(()=>{const graded=result.answers.find((a:any)=>a.questionIndex===index);return <p className="gk-hint">{graded?.isCorrect?'Correct.':`Correct answer: ${question.options[graded?.correctIndex]}.`} {graded?.explanation}</p>;})()}</section>)}{error&&<p className="gk-error">{error}</p>}{result?<p className="gk-notice">Score: {result.score} / {result.total}</p>:<button className="gk-btn gk-btn-primary" disabled={busy||Object.keys(answers).length!==quiz.questions.length}>{busy?'Submitting…':'Submit quiz'}</button>}</form>;
 }
 
@@ -904,14 +957,14 @@ function AnnotationPanel({token,fileId,versionId,units,format,classroom}:{token:
   async function resolve(id:string,resolved:boolean){try{await request(`/annotations/${id}/resolve`,token,{method:'POST',body:JSON.stringify({resolved})});refresh();}catch(e){setError(e instanceof Error?e.message:'Could not update annotation.');}}
   const locatorOf=(a:any)=>a.mapped_locator||a.locator;
   return <section className="gk-stat-card" style={{marginTop:16}}><h2>Section notes</h2><div className="gk-picker-actions"><label>Filter <select value={filter} onChange={e=>setFilter(e.target.value)}><option value="all">All</option><option value="mine">Mine</option><option value="unresolved">Unresolved</option></select></label></div>
-    {units.length>0?<div className="gk-picker-actions" style={{margin:'10px 0',flexWrap:'wrap'}}>{units.map((unit:any)=><button type="button" className="gk-btn gk-btn-ghost gk-btn-sm" key={unit.locator} onClick={()=>setLocator(unit.locator)}>{unit.locator} · {annotations.filter(a=>locatorOf(a)===unit.locator).length}</button>)}</div>:<div className="gk-field"><label>PDF page locator<input value={locator} onChange={e=>setLocator(e.target.value)} placeholder="Page 1" /></label></div>}
+    {units.length>0?<div className="gk-picker-actions" style={{margin:'10px 0',flexWrap:'wrap'}}>{units.map((unit:any)=><button type="button" className="gk-btn gk-btn-ghost gk-btn-sm" key={unit.locator} aria-pressed={locator===unit.locator} onClick={()=>setLocator(unit.locator)}>{unit.locator} · {annotations.filter(a=>locatorOf(a)===unit.locator).length}</button>)}</div>:<div className="gk-field"><label>PDF page locator<input value={locator} onChange={e=>setLocator(e.target.value)} placeholder="Page 1" /></label></div>}
     <form onSubmit={submit}><div className="gk-field"><label>{replyParent?'Reply':'Add a note'}<textarea value={body} onChange={e=>setBody(e.target.value)} maxLength={2000} required /></label></div><div className="gk-field"><label>Quoted text (optional)<input value={quote} onChange={e=>setQuote(e.target.value)} maxLength={300}/></label></div>{classroom&&<div className="gk-field"><label>Visibility<select value={visibility} onChange={e=>setVisibility(e.target.value as 'private'|'class')}><option value="private">Private</option><option value="class">Visible to class</option></select></label></div>}<button className="gk-btn gk-btn-primary" disabled={!locator.trim()||!body.trim()}>{replyParent?'Post reply':'Add note'}</button>{replyParent&&<button type="button" className="gk-btn gk-btn-ghost" onClick={()=>setReplyParent('')}>Cancel reply</button>}</form>
     {error&&<p className="gk-error">{error}</p>}{annotations.map(a=><article className="gk-result-card" key={`${a.id}-${a.version_id}`} style={{opacity:a.outdated?0.55:1}}><strong>{locatorOf(a)}{a.outdated?' · this section changed':''}</strong><p>{a.body}</p>{a.quote&&<blockquote>{a.quote}</blockquote>}<small>{a.visibility} · {a.resolved?'resolved':'open'}</small><div className="gk-picker-actions"><button className="gk-text-btn" onClick={()=>{setReplyParent(a.id);setLocator(locatorOf(a));}}>Reply</button><button className="gk-text-btn" onClick={()=>void resolve(a.id,!a.resolved)}>{a.resolved?'Reopen':'Resolve'}</button></div></article>)}
   </section>;
 }
 
 // ─── FILE PAGE (in-app viewer + AI) ──────────────────────────────────────────
-function FilePage({ token }: { token: string }) {
+function FilePage({ token, onRead }: { token: string; onRead?:(entry:ReadingEntry)=>void }) {
   const { id } = useParams();
   const [file, setFile] = useState<any>(null);
   const [preview, setPreview] = useState<any>(null);
@@ -919,6 +972,39 @@ function FilePage({ token }: { token: string }) {
   const [processing, setProcessing] = useState(false);
   const [failedJob, setFailedJob] = useState<any>(null);
   const [refreshKey, setRefreshKey] = useState(0);
+  const linkedUnit = new URLSearchParams(useLocation().search).get('unit');
+  const linkedArticle = useRef<HTMLElement>(null);
+  const viewer = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (preview && linkedUnit) linkedArticle.current?.scrollIntoView({block:'center'});
+  }, [preview, linkedUnit]);
+  useEffect(() => {
+    if (!id || !onRead || !preview || (file?.file || file)?.id !== id || preview.format === 'quiz') return;
+    const validLink = preview.units?.some((unit:{locator:string}) => unit.locator === linkedUnit)
+      || (preview.format === 'pdf' && /^Page [1-9]\d*$/.test(linkedUnit || ''));
+    const firstLocator = validLink ? linkedUnit : preview.units?.[0]?.locator;
+    onRead({id, locator:firstLocator || undefined});
+    const articles = viewer.current?.querySelectorAll<HTMLElement>('[data-reading-locator]');
+    if (!articles?.length) return;
+    let frame = 0;
+    function notePosition() {
+      frame = 0;
+      if (!articles?.length || !onRead || !id) return;
+      const readingLine = window.innerHeight * .4;
+      if (articles[0].getBoundingClientRect().top > readingLine || articles[articles.length-1].getBoundingClientRect().bottom < readingLine) return;
+      let first=0, last=articles.length-1;
+      while (first < last) {
+        const middle=Math.floor((first+last)/2);
+        if (articles[middle].getBoundingClientRect().bottom < readingLine) first=middle+1;
+        else last=middle;
+      }
+      onRead({id,locator:articles[first].dataset.readingLocator});
+    }
+    const handleScroll=()=>{if (!frame) frame=requestAnimationFrame(notePosition);};
+    // Allow the initial jump to a citation to settle before recording subsequent scrolling.
+    const setup=requestAnimationFrame(()=>window.addEventListener('scroll',handleScroll,{passive:true}));
+    return ()=>{cancelAnimationFrame(setup);cancelAnimationFrame(frame);window.removeEventListener('scroll',handleScroll);};
+  }, [id,file,preview,linkedUnit,onRead]);
 
   useEffect(() => {
     if (!id) return;
@@ -928,10 +1014,6 @@ function FilePage({ token }: { token: string }) {
       try {
         for (;;) {
           const detail = await request(`/files/${id}`, token);
-          detail.versions = await Promise.all((detail.versions || []).map(async (v: any) => {
-            try { return { ...v, ...(await request(`/files/${id}/versions/${v.id}/job`, token)) }; }
-            catch { return v; }
-          }));
           if (cancelled) return;
           setFile(detail);
           const current = detail.versions.find((v: any) => v.current);
@@ -983,7 +1065,7 @@ function FilePage({ token }: { token: string }) {
   return (
     <div className="gk-page gk-file-page">
       <div className="gk-file-header">
-        <Link className="gk-back-link" to={back}>{Icon.back} Back to classroom</Link>
+        <Link className="gk-back-link" to={back}>{Icon.back} {f.owner_type === 'org' ? 'Back to classroom' : 'Back to my files'}</Link>
         <div className="gk-file-title-row">
           <div>
             <h1>{f.name}</h1>
@@ -993,19 +1075,19 @@ function FilePage({ token }: { token: string }) {
         </div>
       </div>
 
-      <div className="gk-document-viewer">
+      <div ref={viewer} className="gk-document-viewer">
         {preview.format === 'quiz'
           ? <QuizViewer token={token} fileId={id!} quiz={preview.quiz} />
           : preview.format === 'pdf'
           ? <iframe
               title={`Preview of ${preview.fileName}`}
-              src={preview.url}
+              src={linkedUnit && /^Page [1-9]\d*$/.test(linkedUnit) ? preview.url.split('#')[0] + '#page=' + linkedUnit.slice(5) : preview.url}
             />
           : (
             <div className={preview.format === 'pptx' ? 'gk-slide-list' : 'gk-document-text'}>
               {preview.units?.length
                 ? preview.units.map((unit: any, i: number) => (
-                  <article className={preview.format === 'pptx' ? 'gk-slide-card' : 'gk-para-card'} key={`${unit.locator}-${i}`}>
+                  <article data-reading-locator={unit.locator} ref={unit.locator === linkedUnit ? linkedArticle : undefined} data-cited={unit.locator === linkedUnit || undefined} className={preview.format === 'pptx' ? 'gk-slide-card' : 'gk-para-card'} key={`${unit.locator}-${i}`}>
                     <span className="gk-unit-label">{unit.locator}</span>
                     <p>{unit.text}</p>
                   </article>
@@ -1057,6 +1139,7 @@ function SearchPage({ token }: { token: string }) {
   const [results, setResults] = useState<any[]>([]);
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
 
+  const [hasSearched, setHasSearched] = useState(false);
   async function submit(e: React.FormEvent) {
     e.preventDefault(); setBusy(true); setError('');
     try {
@@ -1065,7 +1148,7 @@ function SearchPage({ token }: { token: string }) {
       if (name.trim()) params.set('name', name.trim());
       params.set('mode', mode);
       const d = await request(`/search?${params}`, token);
-      setResults(d.results || []); setDegraded(Boolean(d.degraded));
+      setResults(d.results || []); setHasSearched(true); setDegraded(Boolean(d.degraded));
     } catch (err) { setError(err instanceof Error ? err.message : 'Search failed.'); }
     finally { setBusy(false); }
   }
@@ -1074,15 +1157,15 @@ function SearchPage({ token }: { token: string }) {
     <div className="gk-page">
       <div className="gk-page-header"><div><h1>Search</h1><p>Search document content by meaning or by file name.</p></div></div>
       <form className="gk-search-form" onSubmit={submit}>
-        <div className="gk-field"><label>Search mode</label><div className="gk-picker-actions">{(['hybrid','semantic','keyword'] as const).map(value=><button type="button" key={value} className={`gk-btn gk-btn-sm ${mode===value?'gk-btn-primary':'gk-btn-ghost'}`} onClick={()=>setMode(value)}>{value[0].toUpperCase()+value.slice(1)}</button>)}</div></div>
+        <div className="gk-field"><label>Search mode</label><div className="gk-picker-actions">{(['hybrid','semantic','keyword'] as const).map(value=><button type="button" key={value} aria-pressed={mode===value} className={`gk-btn gk-btn-sm ${mode===value?'gk-btn-primary':'gk-btn-ghost'}`} onClick={()=>setMode(value)}>{value[0].toUpperCase()+value.slice(1)}</button>)}</div></div>
         <div className="gk-field"><label>Content search<input value={q} onChange={e => setQ(e.target.value)} placeholder="Search across your documents…" /></label></div>
         <div className="gk-field"><label>File name<input value={name} onChange={e => setName(e.target.value)} placeholder="Filter by name" /></label></div>
-        <button className="gk-btn gk-btn-primary" disabled={busy}>{busy ? 'Searching…' : `${Icon.search} Search`}</button>
+        <button className="gk-btn gk-btn-primary" disabled={busy}>{busy ? 'Searching…' : <>{Icon.search} Search</>}</button>
       </form>
       {degraded && <p className="gk-hint">Vector search is temporarily unavailable; showing keyword results.</p>}
       {error && <p className="gk-error">{error}</p>}
-      {!results.length && !busy
-        ? <div className="gk-empty-state"><p>Enter a query to search your documents.</p></div>
+      {!results.length && !busy && !error
+        ? <div className="gk-empty-state">{Icon.search}<h2>{hasSearched ? 'No matches found' : 'Find a passage or a file'}</h2><p>{hasSearched ? 'Try another phrase or broaden the file name filter.' : 'Enter a phrase from your notes or part of a file name.'}</p></div>
         : results.map((r: any) => (
           <article key={r.unit_id || r.file_id} className="gk-result-card">
             <Link to={`/files/${r.file_id}?unit=${encodeURIComponent(r.locator || '')}`} className="gk-result-title">{r.file_name || r.name}</Link>
@@ -1129,7 +1212,7 @@ function AssistantPage({ token }: { token: string }) {
     return () => clearInterval(timer);
   }, [library, token]);
 
-  useEffect(() => { chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages]);
+  useEffect(() => { const history=chatEndRef.current?.parentElement; if (messages.length && history) history.scrollTop=history.scrollHeight; }, [messages]);
 
   const available = library.filter(f => f.available);
 
@@ -1157,14 +1240,14 @@ function AssistantPage({ token }: { token: string }) {
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(e as any); }
+    if (!busy && !e.nativeEvent.isComposing && e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); ask(e as any); }
   }
 
   return (
     <div className="gk-page gk-assistant-page">
       <div className="gk-page-header">
-        <div><h1>{Icon.ai} AI Study Assistant</h1><p>Ask questions about your indexed files. Sources are retrieved directly — no re-upload needed.</p></div>
-        <button className="gk-btn gk-btn-ghost" onClick={() => setMessages([])} disabled={!messages.length}>New chat</button>
+        <div><h1>SAARA</h1><p>Ask a question and follow the answer back to your course materials.</p></div>
+        <button className="gk-btn gk-btn-ghost" onClick={() => setMessages([])} disabled={busy || !messages.length}>New chat</button>
       </div>
 
       <div className="gk-assistant-layout">
@@ -1207,12 +1290,12 @@ function AssistantPage({ token }: { token: string }) {
             {!messages.length
               ? (
                 <div className="gk-chat-welcome">
-                  <div className="gk-assistant-avatar">G</div>
+                  <Saara mood="welcome" className="welcome-portrait"/>
                   <h2>What are you studying today?</h2>
                   <p>Select source files, then ask for an explanation, summary, comparison, or quiz. Every answer links back to its source.</p>
                   <div className="gk-suggested-prompts">
                     {['Explain the main ideas', 'Summarize key points', 'Make me a study plan', 'Give me 5 practice questions'].map(p => (
-                      <button key={p} className="gk-btn gk-btn-ghost gk-btn-sm" onClick={() => askQuestion(p)}>{p}</button>
+                      <button key={p} className="gk-btn gk-btn-ghost gk-btn-sm" disabled={busy || !selected.length} onClick={() => askQuestion(p)}>{p}</button>
                     ))}
                   </div>
                 </div>
@@ -1220,8 +1303,8 @@ function AssistantPage({ token }: { token: string }) {
               : messages.map((m, i) => (
                 <article className={`gk-chat-msg${m.role === 'user' ? ' user' : ' assistant'}`} key={i}>
                   <div className="gk-msg-header">
-                    {m.role === 'assistant' && <span className="gk-msg-avatar">G</span>}
-                    <strong>{m.role === 'user' ? 'You' : 'Gurukul-AI'}</strong>
+                    {m.role === 'assistant' && <Saara mood={i===messages.length-1 ? "responding" : "idle"} className="message-portrait"/>}
+                    <strong>{m.role === 'user' ? 'You' : 'SAARA'}</strong>
                   </div>
                   <div className="gk-msg-text">{m.text}</div>
                   {m.sources?.length > 0 && (
@@ -1240,7 +1323,7 @@ function AssistantPage({ token }: { token: string }) {
             }
             {busy && (
               <div className="gk-chat-msg assistant gk-thinking">
-                <div className="gk-msg-header"><span className="gk-msg-avatar">G</span><strong>Gurukul-AI</strong></div>
+                <div className="gk-msg-header" role="status"><Saara mood="thinking" className="message-portrait"/><strong>SAARA is thinking…</strong></div>
                 <div className="gk-thinking-dots"><span /><span /><span /></div>
               </div>
             )}
@@ -1249,7 +1332,7 @@ function AssistantPage({ token }: { token: string }) {
 
           <form className="gk-chat-composer" onSubmit={ask}>
             <textarea
-              id="assistant-question"
+              id="assistant-question" aria-label="Question for your study assistant"
               value={question}
               onChange={e => setQuestion(e.target.value)}
               onKeyDown={handleKeyDown}
@@ -1260,7 +1343,7 @@ function AssistantPage({ token }: { token: string }) {
             <div className="gk-composer-footer">
               <span>{selected.length ? `Searching ${selected.length} file${selected.length === 1 ? '' : 's'}` : 'Select files to begin'}</span>
               <button className="gk-btn gk-btn-primary" disabled={busy || !selected.length || !question.trim()}>
-                {busy ? 'Thinking…' : `${Icon.send} Ask`}
+                {busy ? 'Thinking…' : <>Ask {Icon.send}</>}
               </button>
             </div>
           </form>
@@ -1272,21 +1355,60 @@ function AssistantPage({ token }: { token: string }) {
 }
 
 function StudyPage({token}:{token:string}){
+  const {remember} = useRevisionSession();
+  const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
   const [items,setItems]=useState<any[]>([]),[attempts,setAttempts]=useState<any[]>([]),[topics,setTopics]=useState<any[]>([]),[selected,setSelected]=useState<number|null>(null),[answer,setAnswer]=useState<any>(null),[error,setError]=useState('');
-  const refresh=useCallback(async()=>{try{const [q,a,w]=await Promise.all([request('/study/review-queue',token),request('/study/attempts',token),request('/study/weak-topics',token)]);setItems(q.items||[]);setAttempts(a.attempts||[]);setTopics(w.topics||[]);}catch(e){setError(e instanceof Error?e.message:'Could not load study data.');}},[token]);
+  const refresh=useCallback(async()=>{try{const [q,a,w]=await Promise.all([request('/study/review-queue',token),request('/study/attempts',token),request('/study/weak-topics',token)]);setItems(q.items||[]);setAttempts(a.attempts||[]);setTopics(w.topics||[]);}catch(e){setError(e instanceof Error?e.message:'Could not load study data.');}finally{setLoading(false);}},[token]);
   useEffect(()=>{void refresh();},[refresh]);
   const current=items[0];
-  async function submit(){if(!current||selected===null)return;try{setAnswer(await request(`/study/review-queue/${current.id}/answer`,token,{method:'POST',body:JSON.stringify({selectedIndex:selected})}));}catch(e){setError(e instanceof Error?e.message:'Could not submit answer.');}}
-  return <div className="gk-page"><div className="gk-page-header"><div><h1>Study</h1><p>{items.length} question{items.length===1?'':'s'} due for review.</p></div></div>{error&&<p className="gk-error">{error}</p>}<section className="gk-stat-card"><h2>Review queue</h2>{!current?<p className="gk-hint">You are all caught up.</p>:<><p><strong>{current.quizName}</strong> · Box {current.box}</p><h3>{current.question}</h3>{current.options.map((option:string,i:number)=><label key={i} style={{display:'block',padding:'8px 0'}}><input type="radio" name="review-answer" disabled={!!answer} checked={selected===i} onChange={()=>setSelected(i)}/> {option}</label>)}{answer?<><p className="gk-hint">{answer.correct?'Correct.':`Correct answer: ${current.options[answer.correctIndex]}.`} {answer.explanation}</p><button className="gk-btn gk-btn-primary" onClick={()=>{setItems(x=>x.slice(1));setAnswer(null);setSelected(null);}}>Next question</button></>:<button className="gk-btn gk-btn-primary" disabled={selected===null} onClick={()=>void submit()}>Check answer</button>}</>}</section><section className="gk-stat-card" style={{marginTop:16}}><h2>Weak topics</h2><p className="gk-hint">Grouped by quiz because generated questions do not keep source file identifiers.</p>{topics.map((topic:any)=><p key={topic.quiz_file_id}><Link to={`/files/${topic.quiz_file_id}`}>{topic.quiz_name}</Link> · {topic.misses} missed answers</p>)}{!topics.length&&<p className="gk-hint">No misses recorded yet.</p>}</section><section className="gk-stat-card" style={{marginTop:16}}><h2>Attempt history</h2><div className="gk-table-wrap"><table><thead><tr><th>Quiz</th><th>Score</th><th>Date</th></tr></thead><tbody>{attempts.map((a:any)=><tr key={a.id}><td>{a.quiz_name}</td><td>{a.score}/{a.total}</td><td>{new Date(a.created_at).toLocaleString()}</td></tr>)}{!attempts.length&&<tr><td colSpan={3}>No attempts yet.</td></tr>}</tbody></table></div></section></div>;
+  async function submit() {
+    if (!current || selected===null || submitting) return;
+    setSubmitting(true);
+    try {
+      const result = await request(`/study/review-queue/${current.id}/answer`,token,{method:'POST',body:JSON.stringify({selectedIndex:selected})});
+      setAnswer(result);
+      if (result.nextDue) remember({id:current.id, quizFileId:current.quizFileId, question:current.question, dueAt:result.nextDue});
+    } catch(e) { setError(e instanceof Error ? e.message : 'Could not submit answer.'); }
+    finally { setSubmitting(false); }
+  }
+  return <div className="gk-page">
+    <header className="gk-page-header"><div><h1>Study</h1><p>{loading ? 'Loading review queue…' : items.length + (items.length === 1 ? ' question' : ' questions') + ' due for review.'}</p></div></header>
+    {error && <p className="gk-error" role="alert">{error}</p>}
+    {loading ? <div className="gk-loading-inline" role="status"><div className="gk-spinner"/>Loading study history…</div> : <div className="study-spread">
+      <section className="review-sheet">
+        <div className="review-title">{Icon.study}<h2>Review queue</h2></div>
+        {!current ? <p>You are all caught up.</p> : <>
+          <p className="gk-hint">{current.quizName} · Box {current.box}</p><h3>{current.question}</h3>
+          <fieldset disabled={!!answer || submitting}><legend className="visually-hidden">Choose an answer</legend>
+            {current.options.map((option:string,i:number) => <label key={i}><input type="radio" name="review-answer" checked={selected === i} onChange={()=>setSelected(i)} /> {option}</label>)}
+          </fieldset>
+          {answer ? <><p className="gk-notice">{answer.correct ? 'Correct.' : 'Correct answer: ' + current.options[answer.correctIndex] + '.'} {answer.explanation}</p>
+            <button className="gk-btn gk-btn-primary" onClick={()=>{setItems(x=>x.slice(1));setAnswer(null);setSelected(null);}}>Next question</button></>
+            : <button className="gk-btn gk-btn-primary" disabled={selected===null || submitting} onClick={()=>void submit()}>{submitting ? 'Checking…' : 'Check answer'}</button>}
+        </>}
+      </section>
+      <section className="topic-sheet"><h2>Weak topics</h2><p className="gk-hint">Missed questions, grouped by quiz.</p>
+        {topics.map((topic:any)=><p key={topic.quiz_file_id}><Link to={`/files/${topic.quiz_file_id}`}>{topic.quiz_name}</Link> · {topic.misses} missed answers</p>)}
+        {!topics.length && <p>No misses recorded yet.</p>}
+      </section>
+      <section className="attempt-sheet"><h2>Attempt history</h2><div className="gk-table-wrap"><table>
+        <thead><tr><th>Quiz</th><th>Score</th><th>Date</th></tr></thead>
+        <tbody>{attempts.map((attempt:any)=><tr key={attempt.id}><td>{attempt.quiz_name}</td><td>{attempt.score}/{attempt.total}</td><td>{new Date(attempt.created_at).toLocaleString()}</td></tr>)}
+        {!attempts.length && <tr><td colSpan={3}>No attempts yet.</td></tr>}</tbody>
+      </table></div></section>
+    </div>}
+  </div>;
 }
 
 // ─── DASHBOARD PAGE (in-app viewer + AI) ─────────────────────────────────────
-function DashboardPage({ token, isProfessor }: { token: string; isProfessor: boolean }) {
+function StorageDashboard({ token, isProfessor }: { token: string; isProfessor: boolean }) {
   const [stats, setStats] = useState<any>(null), [error, setError] = useState('');
+  const [pipelineError, setPipelineError] = useState('');
   const [pipeline, setPipeline] = useState<any>(null), pipelineRef = useRef<HTMLDivElement | null>(null), [pipelineVisible, setPipelineVisible] = useState(false);
   useEffect(() => { request('/stats', token).then(setStats).catch(e => setError(e.message)); }, [token]);
-  useEffect(() => { if (!isProfessor || !pipelineRef.current) return; const observer = new IntersectionObserver(entries => setPipelineVisible(entries.some(entry => entry.isIntersecting))); observer.observe(pipelineRef.current); return () => observer.disconnect(); }, [isProfessor]);
-  useEffect(() => { if (!isProfessor || !pipelineVisible) return; const load = () => request('/ops/metrics', token).then(setPipeline).catch(() => {}); load(); const timer = setInterval(load, 10000); return () => clearInterval(timer); }, [isProfessor, pipelineVisible, token]);
+  useEffect(() => { if (!isProfessor || !pipelineRef.current) return; const observer = new IntersectionObserver(entries => setPipelineVisible(entries.some(entry => entry.isIntersecting))); observer.observe(pipelineRef.current); return () => observer.disconnect(); }, [isProfessor, stats]);
+  useEffect(() => { if (!isProfessor || !pipelineVisible) return; const load = () => request('/ops/metrics', token).then(data => {setPipelineError('');setPipeline(data);}).catch(error => {setPipeline(null);setPipelineError(error.message);}); load(); const timer = setInterval(load, 10000); return () => clearInterval(timer); }, [isProfessor, pipelineVisible, token]);
   if (error) return <div className="gk-page"><p className="gk-error">{error}</p></div>;
   if (!stats) return <div className="gk-page gk-center"><div className="gk-spinner" /></div>;
   const rows: [string, string, string][] = [
@@ -1300,8 +1422,8 @@ function DashboardPage({ token, isProfessor }: { token: string; isProfessor: boo
     ['Similar files', 'nearDuplicates', 'Similarity flags belonging to you.'],
   ];
   return (
-    <div className="gk-page">
-      <div className="gk-page-header"><div><h1>Dashboard</h1><p>Storage and content stats for your accessible files.</p></div></div>
+    <div className="storage-summary">
+      <div className="desk-section-head"><h2>Storage and content</h2></div>
       <div className="gk-stats-grid">
         {rows.map(([label, key, desc]) => (
           <div key={key} className="gk-stat-card">
@@ -1316,13 +1438,25 @@ function DashboardPage({ token, isProfessor }: { token: string; isProfessor: boo
         <div className="gk-stat-desc">Monthly estimate: naive ${Number(stats.storageCost?.naiveMonthlyUsd || 0).toFixed(4)} · with dedup ${Number(stats.storageCost?.dedupMonthlyUsd || 0).toFixed(4)} · with dedup + simulated tiering ${Number(stats.storageCost?.tieredMonthlyUsd || 0).toFixed(4)}. Estimated savings {Number(stats.storageCost?.savingsPercent || 0).toFixed(1)}%.</div>
         <div className="gk-stat-desc" style={{ marginTop: 8 }}>Upload bandwidth saved before transfer: {Number(stats.uploadBandwidth?.bytesSaved || 0).toLocaleString()} bytes across {Number(stats.uploadBandwidth?.dedupedUploads || 0)} duplicate uploads; direct uploads transferred {Number(stats.uploadBandwidth?.directBytes || 0).toLocaleString()} bytes.</div>
       </section>
-      {isProfessor && <section ref={pipelineRef} className="gk-stat-card" style={{ marginTop: 18 }}>
-        <div className="gk-stat-label">Pipeline health</div>
-        {!pipeline ? <p className="gk-hint">Loading ingestion metrics…</p> : <>
-          <div className="gk-stat-desc">Queue: queued {pipeline.queue?.queued || 0} · running {pipeline.queue?.running || 0} · dead {pipeline.queue?.dead || 0} · p50/p95 {pipeline.durationMs?.p50 ?? '—'} / {pipeline.durationMs?.p95 ?? '—'} ms · failure rate {(Number(pipeline.failureRate || 0) * 100).toFixed(1)}%</div>
-          <div className="gk-table-wrap" style={{ marginTop: 12 }}><table><thead><tr><th>File</th><th>Status</th><th>Attempts</th><th>Duration</th></tr></thead><tbody>{(pipeline.recentJobs || []).map((job: any) => <tr key={job.id}><td>{job.file_name || 'Restricted file'}</td><td>{job.status}</td><td>{job.attempts}/{job.max_attempts}</td><td>{job.duration_ms ?? '—'} ms</td></tr>)}</tbody></table></div>
+      {isProfessor && <section ref={pipelineRef} className="pipeline-ledger">
+        <header className="desk-section-head"><h2>Pipeline health</h2><span>System-wide</span></header>
+        {!pipeline ? <p className={pipelineError ? 'gk-error' : 'desk-note'}>{pipelineError || 'Loading ingestion metrics…'}</p> : <>
+          <div className="pipeline-overview">
+            <section><h3>Current queue</h3><dl>{(['queued','running','dead'] as const).map(status=><div key={status}><dt>{status}</dt><dd>{Number(pipeline.queue?.[status] || 0).toLocaleString()}</dd></div>)}</dl></section>
+            <section><h3>Processing · last 24 hours</h3><dl>
+              <div><dt>Median duration</dt><dd>{pipeline.durationMs?.p50 == null ? '—' : Number(pipeline.durationMs.p50).toLocaleString()+' ms'}</dd></div>
+              <div><dt>95th percentile</dt><dd>{pipeline.durationMs?.p95 == null ? '—' : Number(pipeline.durationMs.p95).toLocaleString()+' ms'}</dd></div>
+              <div><dt>Failure rate</dt><dd>{(Number(pipeline.failureRate)*100).toFixed(1)}%</dd></div>
+            </dl></section>
+          </div>
+          <h3>Recent jobs</h3>
+          <div className="gk-table-wrap"><table><thead><tr><th>File</th><th>Status</th><th>Attempts</th><th>Duration</th></tr></thead>
+          <tbody>{(pipeline.recentJobs || []).map((job: any) => <tr key={job.id}><td>{job.file_name || 'Restricted file'}</td><td>{job.status}</td><td>{job.attempts}/{job.max_attempts}</td><td>{job.duration_ms == null ? '—' : Number(job.duration_ms).toLocaleString()+' ms'}</td></tr>)}
+          {!pipeline.recentJobs?.length && <tr><td colSpan={4}>No ingestion jobs to show.</td></tr>}</tbody></table></div>
         </>}
       </section>}
+
+
     </div>
   );
 }
@@ -1335,18 +1469,18 @@ function TrashPage({ token }: { token: string }) {
   async function restore(id: string) { try { await request(`/files/${id}/restore`, token, { method: 'POST' }); refresh(); } catch (e) { setError(e instanceof Error ? e.message : 'Restore failed.'); } }
   return (
     <div className="gk-page">
-      <div className="gk-page-header"><div><h1>{Icon.trash} Trash</h1><p>Deleted files can be restored during the retention period.</p></div></div>
+      <div className="gk-page-header"><div><h1>Trash</h1><p>Deleted files can be restored during the retention period.</p></div></div>
       {error && <p className="gk-error">{error}</p>}
-      <div className="gk-table-wrap">
+      <div className="gk-table-wrap file-catalog">
         <table>
           <thead><tr><th>Name</th><th>Deleted</th><th>Days left</th><th></th></tr></thead>
           <tbody>
             {files.length
               ? files.map((f: any) => (
-                <tr key={f.id}>
+                <tr className="catalog-entry" key={f.id}>
                   <td>{f.name}</td>
-                  <td>{f.deleted_at ? new Date(f.deleted_at).toLocaleDateString() : '—'}</td>
-                  <td className="numeric">{f.daysLeft ?? '—'}</td>
+                  <td data-field="Deleted">{f.deleted_at ? new Date(f.deleted_at).toLocaleDateString() : '—'}</td>
+                  <td data-field="Days left" className="numeric">{f.daysLeft ?? '—'}</td>
                   <td><button className="gk-btn gk-btn-ghost gk-btn-sm" onClick={() => restore(f.id)}>Restore</button></td>
                 </tr>
               ))
