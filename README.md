@@ -1,6 +1,5 @@
 # Gurukul-AI
-
-> **SAARA** — Smart Academic Assistant for Resource Access  
+ 
 > AI-powered university document platform with semantic search, spaced-repetition study tools, classroom collaboration, and automated ingestion pipelines.
 
 ---
