@@ -1,0 +1,38 @@
+import {Router} from 'express';
+import {pool} from '../db/pool.js';
+import {auth,canRead} from '../core/permissions.js';
+
+const r=Router();r.use(auth);const uuid=/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+async function fileVersion(userId:string,fileId:string,versionId:string){
+  const f=await canRead(userId,fileId);if(!f)return null;
+  const v=await pool.query('SELECT id,version_no FROM file_versions WHERE id=$1 AND file_id=$2',[versionId,fileId]);
+  return v.rowCount?{file:f,version:v.rows[0]}:null;
+}
+function validBody(body:any){return typeof body==='string'&&body.trim().length>=1&&body.trim().length<=2000;}
+
+r.get('/files/:fileId/versions/:versionId/annotations',async(req,res,next)=>{try{
+  if(!uuid.test(req.params.fileId)||!uuid.test(req.params.versionId))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid file or version id'}});
+  if(req.query.filter!==undefined&&!['all','mine','unresolved'].includes(String(req.query.filter)))return res.status(400).json({error:{code:'BAD_REQUEST',message:'filter must be all, mine, or unresolved'}});
+  const access=await fileVersion(req.user!.id,req.params.fileId,req.params.versionId);if(!access)return res.status(404).json({error:{code:'NOT_FOUND',message:'File version not found'}});
+  const previous=await pool.query('SELECT id FROM file_versions WHERE file_id=$1 AND version_no<$2 ORDER BY version_no DESC LIMIT 1',[req.params.fileId,access.version.version_no]);
+  const visibilityFilter="(a.visibility='class' OR a.author_id=$3)";
+  const current=await pool.query(`SELECT a.*,a.unit_id mapped_unit_id,a.locator mapped_locator,false outdated,u.idx FROM annotations a LEFT JOIN units u ON u.id=a.unit_id WHERE a.version_id=$1 AND ${visibilityFilter} ORDER BY u.idx,a.created_at`,[req.params.versionId,req.params.fileId,req.user!.id]);
+  let carried:any[]=[];
+  if(previous.rowCount)carried=(await pool.query(`SELECT a.*,nu.id mapped_unit_id,coalesce(nu.locator,a.locator) mapped_locator,(nu.id IS NULL) outdated,nu.idx FROM annotations a LEFT JOIN units nu ON nu.version_id=$1 AND nu.text_hash=a.anchor_hash WHERE a.version_id=$2 AND ${visibilityFilter} ORDER BY nu.idx NULLS LAST,a.created_at`,[req.params.versionId,previous.rows[0].id,req.user!.id])).rows;
+  const mine=req.query.filter==='mine',unresolved=req.query.filter==='unresolved';let rows=[...current.rows,...carried];if(mine)rows=rows.filter(x=>x.author_id===req.user!.id);if(unresolved)rows=rows.filter(x=>!x.resolved);res.json({annotations:rows});
+}catch(e){next(e);}});
+
+r.post('/files/:fileId/versions/:versionId/annotations',async(req,res,next)=>{try{
+  if(!uuid.test(req.params.fileId)||!uuid.test(req.params.versionId))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid file or version id'}});
+  const access=await fileVersion(req.user!.id,req.params.fileId,req.params.versionId);if(!access)return res.status(404).json({error:{code:'NOT_FOUND',message:'File version not found'}});
+  const {body,quote,locator,unitId,parentId}=req.body||{};if(!validBody(body)||typeof locator!=='string'||!locator.trim()||locator.length>100||quote!==undefined&&(typeof quote!=='string'||quote.length>300)||!['private','class'].includes(req.body.visibility))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid annotation body, locator, quote, or visibility'}});
+  if(req.body.visibility==='class'&&access.file.owner_type!=='org')return res.status(400).json({error:{code:'BAD_REQUEST',message:'Class visibility is available only in classrooms'}});
+  const unit=await pool.query('SELECT id,text_hash,locator FROM units WHERE version_id=$1 AND (($2::uuid IS NOT NULL AND id=$2) OR ($2::uuid IS NULL AND locator=$3)) LIMIT 1',[req.params.versionId,unitId||null,locator]);if(!unit.rowCount)return res.status(400).json({error:{code:'BAD_REQUEST',message:'Choose an extracted section in this version'}});
+  let parent=null;if(parentId){if(!uuid.test(parentId))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid reply parent'}});parent=await pool.query("SELECT id,parent_id,visibility,author_id FROM annotations WHERE id=$1 AND file_id=$2 AND (visibility='class' OR author_id=$3)",[parentId,req.params.fileId,req.user!.id]);if(!parent.rowCount||parent.rows[0].parent_id)return res.status(400).json({error:{code:'BAD_REQUEST',message:'Replies must target a visible top-level annotation'}});}
+  const result=await pool.query('INSERT INTO annotations(file_id,version_id,unit_id,locator,anchor_hash,quote,body,visibility,author_id,parent_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',[req.params.fileId,req.params.versionId,unit.rows[0].id,unit.rows[0].locator,unit.rows[0].text_hash,quote||null,body.trim(),req.body.visibility,req.user!.id,parentId||null]);res.status(201).json({annotation:result.rows[0]});
+}catch(e){next(e);}});
+
+r.patch('/annotations/:id',async(req,res,next)=>{try{if(!uuid.test(req.params.id)||!validBody(req.body?.body))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Annotation body must be 1–2000 characters'}});const old=await pool.query('SELECT file_id FROM annotations WHERE id=$1 AND author_id=$2',[req.params.id,req.user!.id]);if(!old.rowCount||!await canRead(req.user!.id,old.rows[0].file_id))return res.status(404).json({error:{code:'NOT_FOUND',message:'Annotation not found'}});const q=await pool.query('UPDATE annotations SET body=$1,updated_at=now() WHERE id=$2 AND author_id=$3 RETURNING *',[req.body.body.trim(),req.params.id,req.user!.id]);res.json({annotation:q.rows[0]});}catch(e){next(e);}});
+r.delete('/annotations/:id',async(req,res,next)=>{try{if(!uuid.test(req.params.id))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid annotation id'}});const q=await pool.query('SELECT * FROM annotations WHERE id=$1',[req.params.id]);if(!q.rowCount)return res.status(404).json({error:{code:'NOT_FOUND',message:'Annotation not found'}});const a=q.rows[0],f=await canRead(req.user!.id,a.file_id);if(!f)return res.status(404).json({error:{code:'NOT_FOUND',message:'Annotation not found'}});let allowed=a.author_id===req.user!.id;if(!allowed&&a.visibility==='class'&&f.owner_type==='org'){const role=await pool.query("SELECT role FROM memberships WHERE user_id=$1 AND org_id=$2 AND role='faculty'",[req.user!.id,f.owner_id]);allowed=!!role.rowCount;}if(!allowed)return res.status(403).json({error:{code:'FORBIDDEN',message:'Cannot delete this annotation'}});await pool.query('UPDATE annotations SET parent_id=NULL WHERE parent_id=$1',[a.id]);await pool.query('DELETE FROM annotations WHERE id=$1',[a.id]);res.json({ok:true});}catch(e){next(e);}});
+r.post('/annotations/:id/resolve',async(req,res,next)=>{try{if(!uuid.test(req.params.id)||typeof req.body?.resolved!=='boolean')return res.status(400).json({error:{code:'BAD_REQUEST',message:'resolved must be a boolean'}});const q=await pool.query('SELECT * FROM annotations WHERE id=$1',[req.params.id]);if(!q.rowCount)return res.status(404).json({error:{code:'NOT_FOUND',message:'Annotation not found'}});const a=q.rows[0],f=await canRead(req.user!.id,a.file_id);if(!f)return res.status(404).json({error:{code:'NOT_FOUND',message:'Annotation not found'}});let allowed=a.author_id===req.user!.id;if(!allowed&&a.visibility==='class'&&f.owner_type==='org')allowed=!!(await pool.query("SELECT 1 FROM memberships WHERE user_id=$1 AND org_id=$2 AND role='faculty'",[req.user!.id,f.owner_id])).rowCount;if(!allowed)return res.status(403).json({error:{code:'FORBIDDEN',message:'Cannot resolve this annotation'}});const updated=await pool.query('UPDATE annotations SET resolved=$1,updated_at=now() WHERE id=$2 RETURNING *',[req.body.resolved,a.id]);res.json({annotation:updated.rows[0]});}catch(e){next(e);}});
+export default r;

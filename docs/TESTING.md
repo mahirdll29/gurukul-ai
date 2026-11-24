@@ -16,8 +16,12 @@ Prepare a five-version DOCX with a few paragraph edits per version, an approxima
 
 ## Automated checks
 
-`npm run build` is the available typecheck and production build command. This checkout does not currently define the requested `test:step1` through `test:step5` scripts or an automated test suite. Run the build after changes; run `npm run check:env` only when the configured Neon, S3-compatible storage, and Gemini services are reachable.
+- `npm run test:unit` runs the offline Vitest unit suite.
+- `npm test` runs the unit suite and database integration suite.
+- The integration suite creates a uniquely named temporary PostgreSQL schema, applies the project schema and migrations there, then drops the schema. It skips with an explicit message when `DATABASE_URL` is absent or unreachable.
+- `npm run typecheck` checks the TypeScript server and client; `npm run build` compiles/builds both.
+- `npm run check:env` requires reachable Neon Postgres/vector, S3-compatible storage, and Gemini embedding services for full external checks.
 
 ## Current environment result
 
-On 14 October 2026, `npm run check:env` reported the required variable names and JWT length as passing, while the Neon database/vector, object-storage round trip, and Gemini embedding checks failed to connect. End-to-end acceptance checks therefore remain unverified in this environment.
+On 24 November 2026, `npm run check:env` reported required variable names and JWT length as passing, while Neon database/vector, object-storage round trip, and Gemini embedding checks failed to connect. `npm test` passed the eight offline unit tests and skipped the three database integration tests because the configured database was unreachable. Docker Compose configuration validation passed, but the Docker Desktop engine was not running, so image builds were not verified. End-to-end acceptance checks therefore remain unverified in this environment.

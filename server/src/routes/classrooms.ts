@@ -2,9 +2,11 @@ import { Router } from 'express';
 import { randomBytes } from 'node:crypto';
 import { pool, transaction } from '../db/pool.js';
 import { auth } from '../core/permissions.js';
+import {filterKAnonymousTopics,tokenizeTopics} from '../core/analytics.js';
 
 const r = Router();
 r.use(auth);
+const validUuid=(value:string)=>/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value);
 
 // ─── GET /classrooms ───────────────────────────────────────────────────────────
 // Returns all classrooms the current user is a member of.
@@ -27,6 +29,22 @@ r.get('/', async (req, res, next) => {
     res.json({ classrooms: result.rows });
   } catch (error) { next(error); }
 });
+
+r.get('/:id/analytics',async(req,res,next)=>{try{
+  if(!validUuid(req.params.id))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid classroom id'}});
+  if(req.user!.accountRole!=='professor')return res.status(403).json({error:{code:'FORBIDDEN',message:'Professor access required'}});
+  const membership=await pool.query("SELECT 1 FROM memberships WHERE user_id=$1 AND org_id=$2 AND role='faculty'",[req.user!.id,req.params.id]);if(!membership.rowCount)return res.status(403).json({error:{code:'FORBIDDEN',message:'Faculty access to this classroom is required'}});
+  const minUsers=Math.max(2,Number(process.env.ANALYTICS_MIN_USERS||3));
+  const [active,cited,units,activity,rawTopics]=await Promise.all([
+    pool.query("SELECT count(DISTINCT e.user_id)::int n FROM usage_events e JOIN memberships m ON m.org_id=e.org_id AND m.user_id=e.user_id AND m.role='student' WHERE e.org_id=$1 AND e.created_at>now()-interval '30 days'",[req.params.id]),
+    pool.query(`SELECT f.id file_id,f.name file_name,count(*)::int citations FROM usage_events e CROSS JOIN LATERAL unnest(e.cited_unit_ids) unit_id JOIN units u ON u.id=unit_id JOIN file_versions v ON v.id=u.version_id JOIN files f ON f.id=v.file_id WHERE e.org_id=$1 AND e.kind='assistant' AND e.created_at>now()-interval '30 days' GROUP BY f.id,f.name ORDER BY citations DESC LIMIT 10`,[req.params.id]),
+    pool.query(`SELECT f.id file_id,f.name file_name,u.id unit_id,u.locator,count(*)::int citations FROM usage_events e CROSS JOIN LATERAL unnest(e.cited_unit_ids) unit_id JOIN units u ON u.id=unit_id JOIN file_versions v ON v.id=u.version_id JOIN files f ON f.id=v.file_id WHERE e.org_id=$1 AND e.kind='assistant' AND e.created_at>now()-interval '30 days' GROUP BY f.id,f.name,u.id,u.locator ORDER BY citations DESC LIMIT 10`,[req.params.id]),
+    pool.query("SELECT date_trunc('day',created_at)::date day,count(*)::int count FROM usage_events WHERE org_id=$1 AND created_at>now()-interval '30 days' GROUP BY 1 ORDER BY 1",[req.params.id]),
+    pool.query("SELECT e.user_id,e.query_text FROM usage_events e JOIN memberships m ON m.org_id=e.org_id AND m.user_id=e.user_id AND m.role='student' WHERE e.org_id=$1 AND e.created_at>now()-interval '30 days'",[req.params.id])
+  ]);
+  const terms=new Map<string,string[]>();for(const row of rawTopics.rows){if(!terms.has(row.user_id))terms.set(row.user_id,[]);terms.get(row.user_id)!.push(...tokenizeTopics(row.query_text));}
+  const withheld=Number(active.rows[0].n)<minUsers;res.json({mostCitedFiles:cited.rows,mostCitedUnits:units.rows,activity:activity.rows,topics:withheld?[]:filterKAnonymousTopics(terms,minUsers),topicsWithheld:withheld,message:withheld?`Topic data is withheld because fewer than ${minUsers} students are active.`:'Topics include terms asked by enough distinct students.'});
+}catch(e){next(e);}});
 
 // ─── POST /classrooms ──────────────────────────────────────────────────────────
 // Create a new classroom (professor only).

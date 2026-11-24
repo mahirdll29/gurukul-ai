@@ -10,7 +10,14 @@ const API = (import.meta.env.VITE_API_URL || (import.meta.env.DEV ? 'http://loca
 
 type Membership = { orgId: string; code: string; name: string; role: 'faculty' | 'student' };
 type User = { id: string; name: string; email: string; accountRole: 'student' | 'professor'; memberships: Membership[] };
-type FileRow = { id: string; name: string; format: string; visibility: string; created_at?: string; versions?: { id: string; version_no: number; status: string; size_bytes: number }[]; archived_at?: string | null };
+type FileRow = { id: string; name: string; format: string; visibility: string; created_at?: string; versions?: { id: string; version_no: number; status: string; size_bytes: number; job_status?: string; job_attempts?: number; job_max_attempts?: number }[]; archived_at?: string | null };
+function ingestionLabel(version: any) {
+  const status = version?.job_status;
+  if (status === 'queued') return 'Queued';
+  if (status === 'running') return `Processing${version.job_attempts ? ` · attempt ${version.job_attempts}/${version.job_max_attempts}` : ''}`;
+  if (status === 'dead' || status === 'failed') return 'Failed';
+  return version?.status || 'Processing';
+}
 type AuthState = { token: string; user: User | null; portal: 'student' | 'professor' };
 
 async function request(path: string, token: string, init: RequestInit = {}) {
@@ -34,6 +41,34 @@ async function request(path: string, token: string, init: RequestInit = {}) {
   const data = response.status === 204 ? null : await response.json();
   if (!response.ok) throw new Error(data?.error?.message || `Request failed (HTTP ${response.status}).`);
   return data;
+}
+
+async function uploadToApi(file: File, token: string, params: Record<string, unknown>, onProgress?: (value:number)=>void) {
+  const fallback = async () => {
+    const data = new FormData(); data.append('file', file);
+    for (const [key, value] of Object.entries(params)) data.append(key, typeof value === 'string' ? value : JSON.stringify(value));
+    return request('/files', token, { method: 'POST', body: data });
+  };
+  let init: any;
+  try {
+    const bytes = await file.arrayBuffer();
+    const digest = await crypto.subtle.digest('SHA-256', bytes);
+    const sha256 = [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+    init = await request('/files/uploads/init', token, { method: 'POST', body: JSON.stringify({ ...params, filename: file.name, size: file.size, sha256 }) });
+  } catch { const result = await fallback(); return { ...result, fallback: true }; }
+  if (init.deduped) return { ...init, direct: true };
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const xhr = new XMLHttpRequest(); xhr.open('PUT', init.url);
+      for (const [key, value] of Object.entries(init.headers || {})) xhr.setRequestHeader(key, String(value));
+      xhr.upload.onprogress = event => { if (event.lengthComputable) onProgress?.(Math.round(event.loaded / event.total * 100)); };
+      xhr.onload = () => xhr.status >= 200 && xhr.status < 300 ? resolve() : reject(new Error(`Object storage upload failed (${xhr.status})`));
+      xhr.onerror = () => reject(new Error('Direct upload failed; retrying through the API.'));
+      xhr.onabort = () => reject(new Error('Direct upload was interrupted.'));
+      xhr.send(file);
+    });
+  } catch { const result = await fallback(); return { ...result, fallback: true }; }
+  return { ...(await request(`/files/uploads/${init.uploadId}/complete`, token, { method: 'POST', body: '{}' })), direct: true };
 }
 
 // ─── CLASSROOM BANNER COLOURS (cycles) ───────────────────────────────────────
@@ -165,7 +200,7 @@ function App() {
   const navLinks: { label: string; href: string; icon: string }[] =
     auth.portal === 'professor'
       ? [{ label: 'Home', href: '/professor', icon: Icon.home }, { label: 'My Files', href: '/spaces/personal', icon: Icon.files }, { label: 'AI Assistant', href: '/assistant', icon: Icon.ai }, { label: 'Search', href: '/search', icon: Icon.search }, { label: 'Dashboard', href: '/dashboard', icon: Icon.dashboard }, { label: 'Trash', href: '/trash', icon: Icon.trash }]
-      : [{ label: 'Home', href: '/student', icon: Icon.home }, { label: 'My Files', href: '/spaces/personal', icon: Icon.files }, { label: 'AI Assistant', href: '/assistant', icon: Icon.ai }, { label: 'Search', href: '/search', icon: Icon.search }, { label: 'Dashboard', href: '/dashboard', icon: Icon.dashboard }];
+      : [{ label: 'Home', href: '/student', icon: Icon.home }, { label: 'My Files', href: '/spaces/personal', icon: Icon.files }, { label: 'AI Assistant', href: '/assistant', icon: Icon.ai }, { label: 'Search', href: '/search', icon: Icon.search }, { label: 'Study', href: '/study', icon: '✎' }, { label: 'Dashboard', href: '/dashboard', icon: Icon.dashboard }];
 
   const isActive = (href: string) => location.pathname === href || (href !== '/professor' && href !== '/student' && location.pathname.startsWith(href));
 
@@ -250,7 +285,8 @@ function App() {
           <Route path="/files/:id" element={<FilePage token={auth.token} />} />
           <Route path="/search" element={<SearchPage token={auth.token} />} />
           <Route path="/assistant" element={<AssistantPage token={auth.token} />} />
-          <Route path="/dashboard" element={<DashboardPage token={auth.token} />} />
+          <Route path="/study" element={<StudyPage token={auth.token} />} />
+          <Route path="/dashboard" element={<DashboardPage token={auth.token} isProfessor={auth.user.accountRole === 'professor'} />} />
           <Route path="/trash" element={<TrashPage token={auth.token} />} />
           <Route path="*" element={<Navigate to={auth.portal === 'professor' ? '/professor' : '/student'} replace />} />
         </Routes>
@@ -395,13 +431,15 @@ function PortalPage({ user, portal, token }: { user: User; portal: 'student' | '
 // ─── CLASSROOM PAGE (Google Classroom-like) ───────────────────────────────────
 function ClassroomPage({ token, user, portal }: { token: string; user: User; portal: 'student' | 'professor' }) {
   const { id = '' } = useParams();
-  const [tab, setTab] = useState<'stream' | 'materials' | 'members'>('stream');
+  const [tab, setTab] = useState<'stream' | 'materials' | 'members' | 'insights'>('stream');
   const [classroom, setClassroom] = useState<any>(null);
   const [files, setFiles] = useState<FileRow[]>([]);
   const [members, setMembers] = useState<any[]>([]);
   const [busy, setBusy] = useState(true), [error, setError] = useState('');
   const [selected, setSelected] = useState<File | null>(null);
+  const [selectedFiles,setSelectedFiles]=useState<File[]>([]);
   const [uploading, setUploading] = useState(false), [uploadMsg, setUploadMsg] = useState('');
+  const [uploadProgress,setUploadProgress]=useState<number|null>(null);
   const [visibility, setVisibility] = useState<'classroom' | 'selected'>('classroom');
   const [shareWith, setShareWith] = useState<string[]>([]);
   const [shareSearch, setShareSearch] = useState('');
@@ -437,24 +475,20 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
   async function upload(e: React.FormEvent) {
     e.preventDefault();
     if (!selected) return;
-    if (membership?.role === 'student' && visibility === 'selected' && !shareWith.length) {
+    if (visibility === 'selected' && !shareWith.length) {
       setError('Choose at least one classmate to share with, or share with everyone.');
       return;
     }
     setUploading(true); setError(''); setUploadMsg('');
     try {
-      const data = new FormData();
-      data.append('file', selected);
-      data.append('scope', `org:${id}`);
-      data.append('visibility', visibility);
-      data.append('shareWith', JSON.stringify(shareWith));
-      const result = await request('/files', token, { method: 'POST', body: data });
-      setUploadMsg(result.dedup?.matchedScope === 'shared' ? '✓ File already in course — linked, no extra storage used.' : '✓ Upload started. Processing…');
-      setSelected(null); if (fileInputRef.current) fileInputRef.current.value = '';
+      const pending=selectedFiles.length?selectedFiles:[selected];let fallback=false,deduped=0;
+      for(const file of pending){const result=await uploadToApi(file,token,{scope:`org:${id}`,visibility,shareWith},setUploadProgress);fallback ||= Boolean(result.fallback);if(result.deduped||result.dedup?.exact)deduped++;}
+      setUploadMsg(`${pending.length} file${pending.length===1?'':'s'} uploaded. ${deduped} matched existing content.${fallback?' Direct upload fell back to the API.':' Processing…'}`);
+      setSelected(null);setSelectedFiles([]); if (fileInputRef.current) fileInputRef.current.value = '';
       setShareWith([]);
       setTimeout(refreshFiles, 2000);
     } catch (err) { setError(err instanceof Error ? err.message : 'Upload failed.'); }
-    finally { setUploading(false); }
+    finally { setUploading(false); setUploadProgress(null); }
   }
 
   const p = classroom ? palette(id) : BANNER_PALETTES[0];
@@ -484,15 +518,16 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
 
       {/* Tabs */}
       <div className="gk-class-tabs">
-        {(['stream', 'materials', 'members'] as const).map(t => (
+        {(['stream', 'materials', 'members', ...(isFaculty?['insights' as const]:[])] as const).map(t => (
           <button key={t} className={`gk-class-tab${tab === t ? ' active' : ''}`} onClick={() => setTab(t)}>
-            {t === 'stream' ? `${Icon.announce} Stream` : t === 'materials' ? `${Icon.material} Materials` : `${Icon.people} Members`}
+            {t === 'stream' ? `${Icon.announce} Stream` : t === 'materials' ? `${Icon.material} Materials` : t === 'members' ? `${Icon.people} Members` : 'Insights'}
           </button>
         ))}
       </div>
 
       {error && <div className="gk-error gk-error-bar" role="alert" style={{ margin: '0 24px 0' }}>{error} <button className="gk-text-btn" onClick={() => setError('')}>{Icon.close}</button></div>}
       {uploadMsg && <div className="gk-notice gk-notice-bar" style={{ margin: '0 24px 12px' }}>{uploadMsg}</div>}
+      {uploadProgress!==null&&<div style={{margin:'0 24px 12px'}}><progress value={uploadProgress} max={100} /> {uploadProgress}%</div>}
 
       <div className="gk-class-body">
         {/* ── STREAM TAB ── */}
@@ -532,33 +567,33 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
                   {!selected
                     ? (
                       <label className="gk-file-drop" htmlFor="class-file-input">
-                        <input id="class-file-input" type="file" accept=".docx,.pptx,.pdf" ref={fileInputRef}
-                          onChange={e => setSelected(e.target.files?.[0] || null)} style={{ display: 'none' }} />
+                        <input id="class-file-input" type="file" accept=".docx,.pptx,.pdf" multiple ref={fileInputRef}
+                          onChange={e => {const files=Array.from(e.target.files||[]);setSelectedFiles(files);setSelected(files[0]||null);}} style={{ display: 'none' }} />
                         <span className="gk-file-drop-icon">{Icon.upload}</span>
                         <span>Click to upload a PDF, PPTX, or DOCX</span>
                       </label>
                     )
                     : (
                       <div className="gk-selected-file">
-                        <span>{Icon.material} {selected.name}</span>
-                        <button type="button" className="gk-icon-btn" onClick={() => { setSelected(null); if (fileInputRef.current) fileInputRef.current.value = ''; }}>{Icon.close}</button>
+                        <span>{Icon.material} {selectedFiles.length>1?`${selected.name} + ${selectedFiles.length-1} more`:selected.name}</span>
+                        <button type="button" className="gk-icon-btn" onClick={() => { setSelected(null);setSelectedFiles([]); if (fileInputRef.current) fileInputRef.current.value = ''; }}>{Icon.close}</button>
                       </div>
                     )
                   }
 
                   {/* Student selective sharing */}
-                  {selected && membership?.role === 'student' && (
+                  {selected && membership && (
                     <div className="gk-share-controls">
                       <label className="gk-field">
                         Share with
                         <select value={visibility} onChange={e => setVisibility(e.target.value as 'classroom' | 'selected')}>
                           <option value="classroom">Everyone in this classroom</option>
-                          <option value="selected">Only selected classmates</option>
+                          <option value="selected">Only selected students</option>
                         </select>
                       </label>
                       {visibility === 'selected' && (
                         <div className="gk-classmate-picker">
-                          <strong>Select classmates ({shareWith.length} selected)</strong>
+                          <strong>{isFaculty ? 'Select students' : 'Select classmates'} ({shareWith.length} selected)</strong>
                           <input aria-label="Search classmates" placeholder="Search classmates by name…" value={shareSearch} onChange={e => setShareSearch(e.target.value)} />
                           {filteredClassmates.length
                             ? filteredClassmates.map(person => (
@@ -577,7 +612,7 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
                   )}
 
                   {selected && (
-                    <button className="gk-btn gk-btn-primary" disabled={uploading || (membership?.role === 'student' && visibility === 'selected' && !shareWith.length)}>
+                    <button className="gk-btn gk-btn-primary" disabled={uploading || (visibility === 'selected' && !shareWith.length)}>
                       {uploading ? 'Uploading…' : 'Post'}
                     </button>
                   )}
@@ -607,20 +642,15 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
               <h2>Class Materials</h2>
               <label className="gk-btn gk-btn-primary">
                 {Icon.upload} Upload
-                <input type="file" accept=".docx,.pptx,.pdf" style={{ display: 'none' }} onChange={async e => {
-                  const file = e.target.files?.[0]; if (!file) return;
+                <input type="file" accept=".docx,.pptx,.pdf" multiple style={{ display: 'none' }} onChange={async e => {
+                  const files = Array.from(e.target.files||[]); if (!files.length) return;
                   setUploading(true); setError(''); setUploadMsg('');
                   try {
-                    const data = new FormData();
-                    data.append('file', file);
-                    data.append('scope', `org:${id}`);
-                    data.append('visibility', 'classroom');
-                    data.append('shareWith', '[]');
-                    await request('/files', token, { method: 'POST', body: data });
-                    setUploadMsg('✓ Upload started. Processing…');
+                    for(const file of files)await uploadToApi(file,token,{scope:`org:${id}`,visibility:'classroom',shareWith:[]},setUploadProgress);
+                    setUploadMsg(`✓ ${files.length} file${files.length===1?'':'s'} uploaded. Processing…`);
                     setTimeout(refreshFiles, 2000);
                   } catch (err) { setError(err instanceof Error ? err.message : 'Upload failed.'); }
-                  finally { setUploading(false); e.target.value = ''; }
+                  finally { setUploading(false);setUploadProgress(null); e.target.value = ''; }
                 }} />
               </label>
             </div>
@@ -637,7 +667,7 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
                           <div className="gk-material-icon">{f.format === 'pdf' ? '📄' : f.format === 'pptx' ? '📊' : '📝'}</div>
                           <div className="gk-material-info">
                             <strong>{f.name}</strong>
-                            <small>{f.format.toUpperCase()} · {latest ? `${(Number(latest.size_bytes) / 1024).toFixed(1)} KB` : '—'} · <span className={`gk-badge ${latest?.status}`}>{latest?.status || 'Processing'}</span></small>
+                            <small>{f.format.toUpperCase()} · {latest ? `${(Number(latest.size_bytes) / 1024).toFixed(1)} KB` : '—'} · <span className={`gk-badge ${latest?.status}`}>{ingestionLabel(latest)}</span></small>
                           </div>
                           <span className="gk-material-arrow">→</span>
                         </Link>
@@ -680,9 +710,18 @@ function ClassroomPage({ token, user, portal }: { token: string; user: User; por
             </div>
           </div>
         )}
+        {tab === 'insights' && isFaculty && <ClassroomInsights token={token} classroomId={id} />}
       </div>
     </div>
   );
+}
+
+function ClassroomInsights({token,classroomId}:{token:string;classroomId:string}){
+  const [data,setData]=useState<any>(null),[visible,setVisible]=useState(false),[error,setError]=useState(''),ref=useRef<HTMLDivElement|null>(null);
+  useEffect(()=>{if(!ref.current)return;const observer=new IntersectionObserver(entries=>setVisible(entries.some(e=>e.isIntersecting)));observer.observe(ref.current);return()=>observer.disconnect();},[]);
+  useEffect(()=>{if(!visible)return;const load=()=>request(`/classrooms/${classroomId}/analytics`,token).then(setData).catch(e=>setError(e.message));load();const timer=setInterval(load,10000);return()=>clearInterval(timer);},[visible,classroomId,token]);
+  const max=Math.max(1,...(data?.activity||[]).map((x:any)=>Number(x.count)));
+  return <div ref={ref} className="gk-class-members"><h2>Class insights</h2><p className="gk-hint">Topics are shown only when enough distinct students ask about them. No user identities or raw queries appear here.</p>{error&&<p className="gk-error">{error}</p>}{!data?<p className="gk-hint">Loading classroom insights…</p>:<><p>{data.message}</p><h3>Activity · last 30 days</h3><div style={{display:'flex',alignItems:'end',gap:4,height:120,overflowX:'auto'}}>{data.activity.map((d:any)=><div key={d.day} title={`${d.day}: ${d.count}`} style={{minWidth:12,height:`${Math.max(5,Number(d.count)/max*100)}%`,background:'#6d7b61',borderRadius:4}} />)}</div><h3>Most cited materials</h3>{data.mostCitedFiles.map((x:any)=><p key={x.file_id}>{x.file_name} · {x.citations} citations</p>)}<h3>Most cited sections</h3>{data.mostCitedUnits.map((x:any)=><p key={x.unit_id}>{x.file_name} · {x.locator} · {x.citations}</p>)}<h3>Top topics</h3>{data.topicsWithheld?<p>Topic data is withheld for privacy.</p>:data.topics.map((x:any)=><span className="gk-badge" key={x.term} style={{margin:4}}>{x.term} · {x.count}</span>)}</>}</div>;
 }
 
 function StreamPost({ file, latest, classroomId }: { file: FileRow; latest: any; classroomId: string }) {
@@ -693,7 +732,7 @@ function StreamPost({ file, latest, classroomId }: { file: FileRow; latest: any;
       <div className="gk-post-content">
         <div className="gk-post-meta">
           <span className="gk-post-type">{file.format.toUpperCase()} · {file.visibility === 'classroom' ? 'Everyone' : 'Selected students'}</span>
-          <span className={`gk-badge ${latest?.status}`}>{latest?.status || 'Processing'}</span>
+          <span className={`gk-badge ${latest?.status}`}>{ingestionLabel(latest)}</span>
         </div>
         <Link to={`/files/${file.id}`} className="gk-post-title">{file.name}</Link>
         <div className="gk-post-actions">
@@ -712,7 +751,9 @@ function FilesPage({ token, user }: { token: string; user: User }) {
   const [busy, setBusy] = useState(true), [error, setError] = useState('');
   const [showArchived, setShowArchived] = useState(false);
   const [selected, setSelected] = useState<File | null>(null);
+  const [selectedFiles,setSelectedFiles]=useState<File[]>([]);
   const [uploading, setUploading] = useState(false), [message, setMessage] = useState('');
+  const [uploadProgress,setUploadProgress]=useState<number|null>(null);
   const [members, setMembers] = useState<any[]>([]);
   const [visibility, setVisibility] = useState<'classroom' | 'selected'>('classroom');
   const [shareWith, setShareWith] = useState<string[]>([]);
@@ -748,14 +789,12 @@ function FilesPage({ token, user }: { token: string; user: User }) {
     }
     setUploading(true); setError(''); setMessage('');
     try {
-      const data = new FormData();
-      data.append('file', selected); data.append('scope', scope);
-      data.append('visibility', visibility); data.append('shareWith', JSON.stringify(shareWith));
-      const result = await request('/files', token, { method: 'POST', body: data });
-      setMessage(result.dedup?.matchedScope === 'shared' ? '✓ Matched a course file. No new storage used.' : result.dedup?.matchedScope === 'own' ? '✓ You already stored this file.' : '✓ Upload started.');
-      setSelected(null); refresh();
+      const pending=selectedFiles.length?selectedFiles:[selected];let fallback=false,deduped=0;
+      for(const file of pending){const result=await uploadToApi(file,token,{scope,visibility,shareWith},setUploadProgress);fallback ||= Boolean(result.fallback);if(result.deduped||result.dedup?.exact)deduped++;}
+      setMessage(`${pending.length} file${pending.length===1?'':'s'} uploaded; ${deduped} matched existing content.${fallback?' Direct upload fell back to the API.':''}`);
+      setSelected(null);setSelectedFiles([]); refresh();
     } catch (err) { setError(err instanceof Error ? err.message : 'Upload failed.'); }
-    finally { setUploading(false); }
+    finally { setUploading(false); setUploadProgress(null); }
   }
 
   const title = space === 'personal' ? 'My personal files' : `${membership?.code || 'Course'} ${membership?.name || ''}`.trim();
@@ -767,7 +806,7 @@ function FilesPage({ token, user }: { token: string; user: User }) {
         {canUpload && (
           <label className="gk-btn gk-btn-primary">
             {Icon.upload} Upload file
-            <input type="file" accept=".docx,.pptx,.pdf" style={{ display: 'none' }} onChange={e => setSelected(e.target.files?.[0] || null)} />
+                <input type="file" accept=".docx,.pptx,.pdf" multiple style={{ display: 'none' }} onChange={e => {const files=Array.from(e.target.files||[]);setSelectedFiles(files);setSelected(files[0]||null);}} />
           </label>
         )}
       </div>
@@ -775,7 +814,7 @@ function FilesPage({ token, user }: { token: string; user: User }) {
       {selected && (
         <form className="gk-upload-form" onSubmit={upload}>
           <div className="gk-upload-file-row">
-            <span>{Icon.material} {selected.name}</span>
+            <span>{Icon.material} {selectedFiles.length>1?`${selected.name} + ${selectedFiles.length-1} more`:selected.name}</span>
             <button type="button" className="gk-icon-btn" onClick={() => setSelected(null)}>{Icon.close}</button>
           </div>
           {space !== 'personal' && membership?.role === 'student' && (
@@ -815,6 +854,7 @@ function FilesPage({ token, user }: { token: string; user: User }) {
       )}
 
       {message && <div className="gk-notice gk-notice-bar">{message}</div>}
+      {uploadProgress!==null&&<div style={{margin:'8px 0'}}><progress value={uploadProgress} max={100} /> {uploadProgress}%</div>}
       {error && <p className="gk-error">{error} <button className="gk-text-btn" onClick={refresh}>Retry</button></p>}
 
       <label className="gk-toggle">
@@ -836,7 +876,7 @@ function FilesPage({ token, user }: { token: string; user: User }) {
                       <td><span className="gk-format-badge">{f.format}</span></td>
                       <td className="numeric">{latest ? `${(Number(latest.size_bytes) / 1024).toFixed(1)} KB` : '—'}</td>
                       <td className="numeric">{f.versions?.length || 0}</td>
-                      <td><span className={`gk-badge ${latest?.status}`}>{latest?.status || 'Processing'}</span></td>
+                      <td><span className={`gk-badge ${latest?.status}`}>{ingestionLabel(latest)}</span></td>
                       <td><Link to={`/files/${f.id}`} className="gk-btn gk-btn-ghost gk-btn-sm">{Icon.eye} View</Link></td>
                     </tr>
                   );
@@ -850,6 +890,26 @@ function FilesPage({ token, user }: { token: string; user: User }) {
   );
 }
 
+function QuizViewer({ token, fileId, quiz }: { token:string; fileId:string; quiz:any }) {
+  const [answers,setAnswers]=useState<Record<number,number>>({}),[result,setResult]=useState<any>(null),[error,setError]=useState(''),[busy,setBusy]=useState(false);
+  async function submit(e:React.FormEvent){e.preventDefault();setBusy(true);setError('');try{setResult(await request(`/quizzes/${fileId}/attempts`,token,{method:'POST',body:JSON.stringify({answers:Object.entries(answers).map(([questionIndex,selectedIndex])=>({questionIndex:Number(questionIndex),selectedIndex}))})}));}catch(err){setError(err instanceof Error?err.message:'Could not submit quiz.');}finally{setBusy(false);}}
+  return <form onSubmit={submit}><h2>{quiz.title||'Study quiz'}</h2>{(quiz.questions||[]).map((question:any,index:number)=><section className="gk-stat-card" style={{marginBottom:12}} key={index}><strong>{index+1}. {question.question}</strong>{question.options.map((option:string,choice:number)=><label key={choice} style={{display:'block',padding:'6px 0'}}><input type="radio" name={`q-${index}`} checked={answers[index]===choice} disabled={!!result} onChange={()=>setAnswers(a=>({...a,[index]:choice}))}/> {option}</label>)}{result&&(()=>{const graded=result.answers.find((a:any)=>a.questionIndex===index);return <p className="gk-hint">{graded?.isCorrect?'Correct.':`Correct answer: ${question.options[graded?.correctIndex]}.`} {graded?.explanation}</p>;})()}</section>)}{error&&<p className="gk-error">{error}</p>}{result?<p className="gk-notice">Score: {result.score} / {result.total}</p>:<button className="gk-btn gk-btn-primary" disabled={busy||Object.keys(answers).length!==quiz.questions.length}>{busy?'Submitting…':'Submit quiz'}</button>}</form>;
+}
+
+function AnnotationPanel({token,fileId,versionId,units,format,classroom}:{token:string;fileId:string;versionId:string;units:any[];format:string;classroom:boolean}){
+  const [annotations,setAnnotations]=useState<any[]>([]),[filter,setFilter]=useState('all'),[locator,setLocator]=useState(''),[body,setBody]=useState(''),[quote,setQuote]=useState(''),[visibility,setVisibility]=useState<'private'|'class'>('private'),[replyParent,setReplyParent]=useState(''),[error,setError]=useState('');
+  const refresh=useCallback(()=>request(`/files/${fileId}/versions/${versionId}/annotations?filter=${filter}`,token).then(d=>setAnnotations(d.annotations||[])).catch(e=>setError(e.message)),[fileId,versionId,filter,token]);
+  useEffect(()=>{void refresh();},[refresh]);
+  async function submit(e:React.FormEvent){e.preventDefault();try{await request(`/files/${fileId}/versions/${versionId}/annotations`,token,{method:'POST',body:JSON.stringify({locator,body,quote:quote||undefined,visibility,parentId:replyParent||undefined})});setBody('');setQuote('');setReplyParent('');await refresh();}catch(e){setError(e instanceof Error?e.message:'Could not save annotation.');}}
+  async function resolve(id:string,resolved:boolean){try{await request(`/annotations/${id}/resolve`,token,{method:'POST',body:JSON.stringify({resolved})});refresh();}catch(e){setError(e instanceof Error?e.message:'Could not update annotation.');}}
+  const locatorOf=(a:any)=>a.mapped_locator||a.locator;
+  return <section className="gk-stat-card" style={{marginTop:16}}><h2>Section notes</h2><div className="gk-picker-actions"><label>Filter <select value={filter} onChange={e=>setFilter(e.target.value)}><option value="all">All</option><option value="mine">Mine</option><option value="unresolved">Unresolved</option></select></label></div>
+    {units.length>0?<div className="gk-picker-actions" style={{margin:'10px 0',flexWrap:'wrap'}}>{units.map((unit:any)=><button type="button" className="gk-btn gk-btn-ghost gk-btn-sm" key={unit.locator} onClick={()=>setLocator(unit.locator)}>{unit.locator} · {annotations.filter(a=>locatorOf(a)===unit.locator).length}</button>)}</div>:<div className="gk-field"><label>PDF page locator<input value={locator} onChange={e=>setLocator(e.target.value)} placeholder="Page 1" /></label></div>}
+    <form onSubmit={submit}><div className="gk-field"><label>{replyParent?'Reply':'Add a note'}<textarea value={body} onChange={e=>setBody(e.target.value)} maxLength={2000} required /></label></div><div className="gk-field"><label>Quoted text (optional)<input value={quote} onChange={e=>setQuote(e.target.value)} maxLength={300}/></label></div>{classroom&&<div className="gk-field"><label>Visibility<select value={visibility} onChange={e=>setVisibility(e.target.value as 'private'|'class')}><option value="private">Private</option><option value="class">Visible to class</option></select></label></div>}<button className="gk-btn gk-btn-primary" disabled={!locator.trim()||!body.trim()}>{replyParent?'Post reply':'Add note'}</button>{replyParent&&<button type="button" className="gk-btn gk-btn-ghost" onClick={()=>setReplyParent('')}>Cancel reply</button>}</form>
+    {error&&<p className="gk-error">{error}</p>}{annotations.map(a=><article className="gk-result-card" key={`${a.id}-${a.version_id}`} style={{opacity:a.outdated?0.55:1}}><strong>{locatorOf(a)}{a.outdated?' · this section changed':''}</strong><p>{a.body}</p>{a.quote&&<blockquote>{a.quote}</blockquote>}<small>{a.visibility} · {a.resolved?'resolved':'open'}</small><div className="gk-picker-actions"><button className="gk-text-btn" onClick={()=>{setReplyParent(a.id);setLocator(locatorOf(a));}}>Reply</button><button className="gk-text-btn" onClick={()=>void resolve(a.id,!a.resolved)}>{a.resolved?'Reopen':'Resolve'}</button></div></article>)}
+  </section>;
+}
+
 // ─── FILE PAGE (in-app viewer + AI) ──────────────────────────────────────────
 function FilePage({ token }: { token: string }) {
   const { id } = useParams();
@@ -857,28 +917,40 @@ function FilePage({ token }: { token: string }) {
   const [preview, setPreview] = useState<any>(null);
   const [error, setError] = useState('');
   const [processing, setProcessing] = useState(false);
+  const [failedJob, setFailedJob] = useState<any>(null);
+  const [refreshKey, setRefreshKey] = useState(0);
 
   useEffect(() => {
     if (!id) return;
     let cancelled = false;
-    setFile(null); setPreview(null); setError(''); setProcessing(true);
+    setFile(null); setPreview(null); setError(''); setFailedJob(null); setProcessing(true);
     (async () => {
       try {
-        const detail = await request(`/files/${id}`, token);
-        if (cancelled) return;
-        setFile(detail);
-        for (let attempt = 0; attempt < 60; attempt++) {
+        for (;;) {
+          const detail = await request(`/files/${id}`, token);
+          detail.versions = await Promise.all((detail.versions || []).map(async (v: any) => {
+            try { return { ...v, ...(await request(`/files/${id}/versions/${v.id}/job`, token)) }; }
+            catch { return v; }
+          }));
+          if (cancelled) return;
+          setFile(detail);
+          const current = detail.versions.find((v: any) => v.current);
+          if (current?.status === 'failed' || current?.status === 'dead') {
+            setFailedJob(current); setError(current.job_error || 'File processing failed.'); return;
+          }
+          if (current?.status === 'ready') {
+          if ((detail.file||detail).format==='quiz') { const data=await request(`/files/${id}/quiz`,token); if(!cancelled)setPreview({format:'quiz',fileName:(detail.file||detail).name,quiz:data.quiz}); return; }
           try {
             const view = await request(`/files/${id}/preview`, token);
             if (!cancelled) setPreview(view);
             return;
           } catch (e) {
-            if (!(e instanceof Error) || !e.message.toLowerCase().includes('still processing') && !e.message.toLowerCase().includes('processing')) throw e;
-            await new Promise(r => setTimeout(r, 1500));
-            if (cancelled) return;
+            if (!(e instanceof Error) || !e.message.toLowerCase().includes('processing')) throw e;
           }
+          }
+          await new Promise(r => setTimeout(r, 3000));
+          if (cancelled) return;
         }
-        throw new Error('File processing is taking longer than expected. Try again shortly.');
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : 'Could not load this file.');
       } finally {
@@ -886,9 +958,15 @@ function FilePage({ token }: { token: string }) {
       }
     })();
     return () => { cancelled = true; };
-  }, [id, token]);
+  }, [id, token, refreshKey]);
 
-  if (error) return <div className="gk-page"><div className="gk-error">{error}</div></div>;
+  async function retryVersion(versionId: string) {
+    if (!id) return;
+    try { await request(`/files/${id}/versions/${versionId}/retry`, token, { method: 'POST' }); setError(''); setFailedJob(null); setPreview(null); setProcessing(true); setRefreshKey(x => x + 1); }
+    catch (e) { setError(e instanceof Error ? e.message : 'Retry failed.'); }
+  }
+
+  if (error) return <div className="gk-page"><div className="gk-error">{error}</div>{failedJob && <button className="gk-btn gk-btn-primary" onClick={() => retryVersion(failedJob.id)}>Retry processing</button>}</div>;
   if (!file || !preview) return (
     <div className="gk-page gk-center">
       <div className="gk-spinner" />
@@ -899,6 +977,7 @@ function FilePage({ token }: { token: string }) {
 
   const f = file.file || file;
   const versions = file.versions || [];
+  const currentVersion = versions.find((v:any)=>v.current);
   const back = f.owner_type === 'org' ? `/classroom/${f.owner_id}` : '/spaces/personal';
 
   return (
@@ -915,7 +994,9 @@ function FilePage({ token }: { token: string }) {
       </div>
 
       <div className="gk-document-viewer">
-        {preview.format === 'pdf'
+        {preview.format === 'quiz'
+          ? <QuizViewer token={token} fileId={id!} quiz={preview.quiz} />
+          : preview.format === 'pdf'
           ? <iframe
               title={`Preview of ${preview.fileName}`}
               src={preview.url}
@@ -935,6 +1016,7 @@ function FilePage({ token }: { token: string }) {
           )
         }
       </div>
+      {currentVersion && <AnnotationPanel token={token} fileId={f.id} versionId={currentVersion.id} units={preview.units||[]} format={preview.format} classroom={f.owner_type==='org'} />}
 
       {versions.length > 0 && (
         <details className="gk-versions-details">
@@ -949,7 +1031,7 @@ function FilePage({ token }: { token: string }) {
                     <td>{new Date(v.created_at).toLocaleString()}</td>
                     <td>{v.uploader}</td>
                     <td>{Number(v.size_bytes).toLocaleString()} B</td>
-                    <td><span className={`gk-badge ${v.status}`}>{v.status}</span></td>
+                    <td><span className={`gk-badge ${v.status}`}>{v.job_status === 'queued' ? 'queued' : v.job_status === 'running' ? 'processing' : v.job_status === 'dead' ? 'failed' : v.status}</span>{v.job_status && !['succeeded','dead'].includes(v.job_status) && <small> · attempt {v.job_attempts} of {v.job_max_attempts}</small>}{v.job_status === 'dead' && <button className="gk-btn gk-btn-ghost gk-btn-sm" style={{ marginLeft: 8 }} onClick={() => retryVersion(v.id)}>Retry</button>}</td>
                   </tr>
                 ))}
               </tbody>
@@ -962,8 +1044,16 @@ function FilePage({ token }: { token: string }) {
 }
 
 // ─── SEARCH PAGE ──────────────────────────────────────────────────────────────
+function highlightQuery(text: string, query: string) {
+  const terms=query.trim().split(/\s+/).filter(Boolean);if(!terms.length)return text;
+  const escaped=terms.map(term=>term.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'));
+  const regex=new RegExp(`(${escaped.join('|')})`,'gi');
+  return text.split(regex).map((part,index)=>terms.some(term=>term.toLowerCase()===part.toLowerCase())?<mark key={index}>{part}</mark>:part);
+}
+
 function SearchPage({ token }: { token: string }) {
   const [q, setQ] = useState(''), [name, setName] = useState('');
+  const [mode, setMode] = useState<'hybrid'|'semantic'|'keyword'>('hybrid'), [degraded, setDegraded] = useState(false);
   const [results, setResults] = useState<any[]>([]);
   const [busy, setBusy] = useState(false), [error, setError] = useState('');
 
@@ -973,8 +1063,9 @@ function SearchPage({ token }: { token: string }) {
       const params = new URLSearchParams();
       if (q.trim()) params.set('q', q.trim());
       if (name.trim()) params.set('name', name.trim());
+      params.set('mode', mode);
       const d = await request(`/search?${params}`, token);
-      setResults(d.results || []);
+      setResults(d.results || []); setDegraded(Boolean(d.degraded));
     } catch (err) { setError(err instanceof Error ? err.message : 'Search failed.'); }
     finally { setBusy(false); }
   }
@@ -983,18 +1074,20 @@ function SearchPage({ token }: { token: string }) {
     <div className="gk-page">
       <div className="gk-page-header"><div><h1>Search</h1><p>Search document content by meaning or by file name.</p></div></div>
       <form className="gk-search-form" onSubmit={submit}>
+        <div className="gk-field"><label>Search mode</label><div className="gk-picker-actions">{(['hybrid','semantic','keyword'] as const).map(value=><button type="button" key={value} className={`gk-btn gk-btn-sm ${mode===value?'gk-btn-primary':'gk-btn-ghost'}`} onClick={()=>setMode(value)}>{value[0].toUpperCase()+value.slice(1)}</button>)}</div></div>
         <div className="gk-field"><label>Content search<input value={q} onChange={e => setQ(e.target.value)} placeholder="Search across your documents…" /></label></div>
         <div className="gk-field"><label>File name<input value={name} onChange={e => setName(e.target.value)} placeholder="Filter by name" /></label></div>
         <button className="gk-btn gk-btn-primary" disabled={busy}>{busy ? 'Searching…' : `${Icon.search} Search`}</button>
       </form>
+      {degraded && <p className="gk-hint">Vector search is temporarily unavailable; showing keyword results.</p>}
       {error && <p className="gk-error">{error}</p>}
       {!results.length && !busy
         ? <div className="gk-empty-state"><p>Enter a query to search your documents.</p></div>
         : results.map((r: any) => (
           <article key={r.unit_id || r.file_id} className="gk-result-card">
             <Link to={`/files/${r.file_id}?unit=${encodeURIComponent(r.locator || '')}`} className="gk-result-title">{r.file_name || r.name}</Link>
-            <span className="gk-result-meta">{r.locator} · {Number(r.score || 0).toFixed(2)}</span>
-            <p className="gk-result-snippet">{r.snippet || r.text?.slice(0, 240)}</p>
+            <span className="gk-result-meta">{r.locator} · {Number(r.score || 0).toFixed(3)} · matched by {r.signals?.join(' + ') || 'filename'}</span>
+            <p className="gk-result-snippet">{highlightQuery(r.snippet || r.text?.slice(0, 240) || '',q)}</p>
           </article>
         ))
       }
@@ -1178,10 +1271,22 @@ function AssistantPage({ token }: { token: string }) {
   );
 }
 
-// ─── DASHBOARD PAGE ───────────────────────────────────────────────────────────
-function DashboardPage({ token }: { token: string }) {
+function StudyPage({token}:{token:string}){
+  const [items,setItems]=useState<any[]>([]),[attempts,setAttempts]=useState<any[]>([]),[topics,setTopics]=useState<any[]>([]),[selected,setSelected]=useState<number|null>(null),[answer,setAnswer]=useState<any>(null),[error,setError]=useState('');
+  const refresh=useCallback(async()=>{try{const [q,a,w]=await Promise.all([request('/study/review-queue',token),request('/study/attempts',token),request('/study/weak-topics',token)]);setItems(q.items||[]);setAttempts(a.attempts||[]);setTopics(w.topics||[]);}catch(e){setError(e instanceof Error?e.message:'Could not load study data.');}},[token]);
+  useEffect(()=>{void refresh();},[refresh]);
+  const current=items[0];
+  async function submit(){if(!current||selected===null)return;try{setAnswer(await request(`/study/review-queue/${current.id}/answer`,token,{method:'POST',body:JSON.stringify({selectedIndex:selected})}));}catch(e){setError(e instanceof Error?e.message:'Could not submit answer.');}}
+  return <div className="gk-page"><div className="gk-page-header"><div><h1>Study</h1><p>{items.length} question{items.length===1?'':'s'} due for review.</p></div></div>{error&&<p className="gk-error">{error}</p>}<section className="gk-stat-card"><h2>Review queue</h2>{!current?<p className="gk-hint">You are all caught up.</p>:<><p><strong>{current.quizName}</strong> · Box {current.box}</p><h3>{current.question}</h3>{current.options.map((option:string,i:number)=><label key={i} style={{display:'block',padding:'8px 0'}}><input type="radio" name="review-answer" disabled={!!answer} checked={selected===i} onChange={()=>setSelected(i)}/> {option}</label>)}{answer?<><p className="gk-hint">{answer.correct?'Correct.':`Correct answer: ${current.options[answer.correctIndex]}.`} {answer.explanation}</p><button className="gk-btn gk-btn-primary" onClick={()=>{setItems(x=>x.slice(1));setAnswer(null);setSelected(null);}}>Next question</button></>:<button className="gk-btn gk-btn-primary" disabled={selected===null} onClick={()=>void submit()}>Check answer</button>}</>}</section><section className="gk-stat-card" style={{marginTop:16}}><h2>Weak topics</h2><p className="gk-hint">Grouped by quiz because generated questions do not keep source file identifiers.</p>{topics.map((topic:any)=><p key={topic.quiz_file_id}><Link to={`/files/${topic.quiz_file_id}`}>{topic.quiz_name}</Link> · {topic.misses} missed answers</p>)}{!topics.length&&<p className="gk-hint">No misses recorded yet.</p>}</section><section className="gk-stat-card" style={{marginTop:16}}><h2>Attempt history</h2><div className="gk-table-wrap"><table><thead><tr><th>Quiz</th><th>Score</th><th>Date</th></tr></thead><tbody>{attempts.map((a:any)=><tr key={a.id}><td>{a.quiz_name}</td><td>{a.score}/{a.total}</td><td>{new Date(a.created_at).toLocaleString()}</td></tr>)}{!attempts.length&&<tr><td colSpan={3}>No attempts yet.</td></tr>}</tbody></table></div></section></div>;
+}
+
+// ─── DASHBOARD PAGE (in-app viewer + AI) ─────────────────────────────────────
+function DashboardPage({ token, isProfessor }: { token: string; isProfessor: boolean }) {
   const [stats, setStats] = useState<any>(null), [error, setError] = useState('');
+  const [pipeline, setPipeline] = useState<any>(null), pipelineRef = useRef<HTMLDivElement | null>(null), [pipelineVisible, setPipelineVisible] = useState(false);
   useEffect(() => { request('/stats', token).then(setStats).catch(e => setError(e.message)); }, [token]);
+  useEffect(() => { if (!isProfessor || !pipelineRef.current) return; const observer = new IntersectionObserver(entries => setPipelineVisible(entries.some(entry => entry.isIntersecting))); observer.observe(pipelineRef.current); return () => observer.disconnect(); }, [isProfessor]);
+  useEffect(() => { if (!isProfessor || !pipelineVisible) return; const load = () => request('/ops/metrics', token).then(setPipeline).catch(() => {}); load(); const timer = setInterval(load, 10000); return () => clearInterval(timer); }, [isProfessor, pipelineVisible, token]);
   if (error) return <div className="gk-page"><p className="gk-error">{error}</p></div>;
   if (!stats) return <div className="gk-page gk-center"><div className="gk-spinner" /></div>;
   const rows: [string, string, string][] = [
@@ -1206,6 +1311,18 @@ function DashboardPage({ token }: { token: string }) {
           </div>
         ))}
       </div>
+      <section className="gk-stat-card" style={{ marginTop: 18 }}>
+        <div className="gk-stat-label">Storage cost · simulated using configurable rates</div>
+        <div className="gk-stat-desc">Monthly estimate: naive ${Number(stats.storageCost?.naiveMonthlyUsd || 0).toFixed(4)} · with dedup ${Number(stats.storageCost?.dedupMonthlyUsd || 0).toFixed(4)} · with dedup + simulated tiering ${Number(stats.storageCost?.tieredMonthlyUsd || 0).toFixed(4)}. Estimated savings {Number(stats.storageCost?.savingsPercent || 0).toFixed(1)}%.</div>
+        <div className="gk-stat-desc" style={{ marginTop: 8 }}>Upload bandwidth saved before transfer: {Number(stats.uploadBandwidth?.bytesSaved || 0).toLocaleString()} bytes across {Number(stats.uploadBandwidth?.dedupedUploads || 0)} duplicate uploads; direct uploads transferred {Number(stats.uploadBandwidth?.directBytes || 0).toLocaleString()} bytes.</div>
+      </section>
+      {isProfessor && <section ref={pipelineRef} className="gk-stat-card" style={{ marginTop: 18 }}>
+        <div className="gk-stat-label">Pipeline health</div>
+        {!pipeline ? <p className="gk-hint">Loading ingestion metrics…</p> : <>
+          <div className="gk-stat-desc">Queue: queued {pipeline.queue?.queued || 0} · running {pipeline.queue?.running || 0} · dead {pipeline.queue?.dead || 0} · p50/p95 {pipeline.durationMs?.p50 ?? '—'} / {pipeline.durationMs?.p95 ?? '—'} ms · failure rate {(Number(pipeline.failureRate || 0) * 100).toFixed(1)}%</div>
+          <div className="gk-table-wrap" style={{ marginTop: 12 }}><table><thead><tr><th>File</th><th>Status</th><th>Attempts</th><th>Duration</th></tr></thead><tbody>{(pipeline.recentJobs || []).map((job: any) => <tr key={job.id}><td>{job.file_name || 'Restricted file'}</td><td>{job.status}</td><td>{job.attempts}/{job.max_attempts}</td><td>{job.duration_ms ?? '—'} ms</td></tr>)}</tbody></table></div>
+        </>}
+      </section>}
     </div>
   );
 }

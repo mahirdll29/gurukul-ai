@@ -1,8 +1,10 @@
 import { Router } from 'express';
 import { pool } from '../db/pool.js';
 import { auth, canRead } from '../core/permissions.js';
-import { embedText } from '../core/embed.js';
+import { hybridRetrieve } from '../core/retrieval.js';
 import { generateText } from '../core/llm.js';
+import { calculateStorageCost } from '../core/storage-cost.js';
+import { logClassroomUsageSafely } from '../core/analytics.js';
 
 const r = Router();
 r.use(auth);
@@ -45,6 +47,13 @@ r.get('/stats', async (req, res, next) => {
       [req.user!.id]
     );
     const x = q.rows[0];
+    const coldQuery=await pool.query(`WITH refs AS (
+      SELECT DISTINCT b.id,b.size_bytes,f.id file_id,f.archived_at,f.deleted_at FROM blobs b
+      JOIN file_versions fv ON fv.blob_id=b.id JOIN files f ON f.id=fv.file_id
+      WHERE ((f.owner_type='user' AND f.owner_id=$1) OR (f.owner_type='org' AND f.owner_id IN(SELECT org_id FROM memberships WHERE user_id=$1) AND (f.created_by=$1 OR f.visibility='classroom' OR EXISTS(SELECT 1 FROM memberships fac WHERE fac.user_id=$1 AND fac.org_id=f.owner_id AND fac.role='faculty') OR EXISTS(SELECT 1 FROM file_shares fs WHERE fs.file_id=f.id AND fs.user_id=$1)))
+    ) SELECT coalesce(sum(size_bytes),0)::bigint bytes FROM (SELECT id,size_bytes FROM refs GROUP BY id,size_bytes HAVING bool_and((archived_at IS NOT NULL OR deleted_at IS NOT NULL) AND coalesce(deleted_at,archived_at)<now()-($2::text||' days')::interval)) cold`,[req.user!.id,Number(process.env.COLD_AFTER_DAYS||30)]);
+    const uploadMetrics=await pool.query('SELECT direct_bytes,dedup_before_transfer_count,dedup_before_transfer_bytes FROM upload_metrics WHERE id=true');
+    const cost=calculateStorageCost({logicalBytes:Number(x.logical_bytes),physicalBytes:Number(x.stored_bytes),coldEligibleBytes:Number(coldQuery.rows[0]?.bytes||0),hotUsdPerGbMonth:Number(process.env.STORAGE_HOT_USD_PER_GB_MONTH||0.023),coldUsdPerGbMonth:Number(process.env.STORAGE_COLD_USD_PER_GB_MONTH||0.004)});
     res.json({
       logicalBytes: Number(x.logical_bytes),
       storedBytes: Number(x.stored_bytes),
@@ -55,9 +64,29 @@ r.get('/stats', async (req, res, next) => {
       files: x.files,
       versions: x.versions,
       nearDuplicates: x.near_duplicates,
+      storageCost: cost,
+      uploadBandwidth: uploadMetrics.rows[0] ? {directBytes:Number(uploadMetrics.rows[0].direct_bytes),dedupedUploads:Number(uploadMetrics.rows[0].dedup_before_transfer_count),bytesSaved:Number(uploadMetrics.rows[0].dedup_before_transfer_bytes)} : {directBytes:0,dedupedUploads:0,bytesSaved:0},
     });
   } catch (e) { next(e); }
 });
+
+r.get('/ops/metrics',async(req,res,next)=>{try{
+  if(req.user!.accountRole!=='professor')return res.status(403).json({error:{code:'FORBIDDEN',message:'Professor access required'}});
+  const [counts,summary,recent,recovered]=await Promise.all([
+    pool.query("SELECT status,count(*)::int count FROM ingestion_jobs GROUP BY status"),
+    pool.query(`SELECT percentile_cont(0.5) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded') p50,
+      percentile_cont(0.95) WITHIN GROUP(ORDER BY duration_ms) FILTER(WHERE status='succeeded') p95,
+      count(*) FILTER(WHERE status IN('succeeded','dead','failed'))::int total,
+      count(*) FILTER(WHERE status IN('dead','failed'))::int failed,
+      coalesce(sum(lease_recoveries),0)::int recovered
+      FROM ingestion_jobs WHERE finished_at>now()-interval '24 hours'`),
+    pool.query(`SELECT j.id,j.status,j.attempts,j.max_attempts,j.duration_ms,j.last_error,j.created_at,
+       CASE WHEN (f.owner_type='user' AND f.owner_id=$1) OR (f.owner_type='org' AND EXISTS(SELECT 1 FROM memberships m WHERE m.user_id=$1 AND m.org_id=f.owner_id AND (m.role='faculty' OR f.created_by=$1 OR f.visibility='classroom' OR EXISTS(SELECT 1 FROM file_shares fs WHERE fs.file_id=f.id AND fs.user_id=$1)))) THEN f.name ELSE NULL END file_name
+       FROM ingestion_jobs j JOIN file_versions v ON v.id=j.version_id JOIN files f ON f.id=v.file_id ORDER BY j.created_at DESC LIMIT 20`,[req.user!.id]),
+    pool.query("SELECT coalesce(sum(lease_recoveries),0)::int n FROM ingestion_jobs WHERE started_at>now()-interval '24 hours'")
+  ]);
+  const m=summary.rows[0],total=Number(m.total||0);res.json({queue:Object.fromEntries(counts.rows.map(x=>[x.status,Number(x.count)])),oldestQueuedAgeSeconds:Number((await pool.query("SELECT coalesce(extract(epoch from(now()-min(created_at))),0)::int age FROM ingestion_jobs WHERE status='queued'")).rows[0].age),durationMs:{p50:m.p50===null?null:Number(m.p50),p95:m.p95===null?null:Number(m.p95)},failureRate:total?Number(m.failed)/total:0,recoveredAfterLeaseExpiry:Number(recovered.rows[0]?.n||0),recentJobs:recent.rows.map(x=>({...x,last_error:x.last_error?String(x.last_error).slice(0,240):null}))});
+}catch(e){next(e);}});
 
 // ─── GET /trash ────────────────────────────────────────────────────────────────
 r.get('/trash', async (req, res, next) => {
@@ -94,8 +123,9 @@ r.get('/search', async (req, res, next) => {
     const qText = String(req.query.q || '').trim();
     const nameFilter = String(req.query.name || '').trim();
     const fileIds = req.query.fileIds ? String(req.query.fileIds).split(',').filter(Boolean) : null;
+    const validUuid=/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
+    if(qText.length>500||nameFilter.length>200||Boolean(fileIds&&(fileIds.length>100||fileIds.some(id=>!validUuid.test(id)))))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Search query, filename filter, or file ids are invalid or too long'}});
     const topK = Number(process.env.RETRIEVAL_TOP_K || 8);
-    const minScore = Number(process.env.RETRIEVAL_MIN_SCORE || 0.35);
 
     if (!qText && !nameFilter) return res.json({ results: [] });
 
@@ -129,45 +159,10 @@ r.get('/search', async (req, res, next) => {
       return res.json({ results: q.rows });
     }
 
-    // Semantic search (with optional name filter)
-    const vec = await embedText(`Represent this question for retrieving relevant document passages: ${qText}`);
-    const q = await pool.query(
-      `SELECT u.id unit_id, u.locator, u.text,
-              f.id file_id, f.name file_name, fv.id version_id,
-              1 - (u.embedding <=> $1::vector) AS score
-       FROM units u
-       JOIN file_versions fv ON fv.id = u.version_id
-       JOIN files f ON f.id = fv.file_id
-       WHERE u.embedding IS NOT NULL
-         AND fv.status = 'ready' AND fv.retracted_at IS NULL
-         AND f.current_version_id = fv.id
-         AND f.deleted_at IS NULL AND f.archived_at IS NULL AND f.searchable = true
-         AND (
-           (f.owner_type = 'user' AND f.owner_id = $2)
-           OR (
-             f.owner_type = 'org'
-             AND f.owner_id IN (SELECT org_id FROM memberships WHERE user_id = $2)
-             AND (
-               f.created_by = $2
-               OR f.visibility = 'classroom'
-               OR EXISTS (SELECT 1 FROM memberships fac WHERE fac.user_id = $2 AND fac.org_id = f.owner_id AND fac.role = 'faculty')
-               OR EXISTS (SELECT 1 FROM file_shares fs WHERE fs.file_id = f.id AND fs.user_id = $2)
-             )
-           )
-         )
-         AND ($3::uuid[] IS NULL OR f.id = ANY($3))
-         AND ($4::text IS NULL OR f.name ILIKE $4)
-       ORDER BY u.embedding <=> $1::vector
-       LIMIT $5`,
-      [`[${vec.join(',')}]`, req.user!.id, fileIds, nameFilter ? `%${nameFilter}%` : null, topK * 2]
-    );
-
-    const results = q.rows
-      .filter(x => Number(x.score) >= minScore)
-      .slice(0, topK)
-      .map(x => ({ ...x, snippet: x.text.slice(0, 320) }));
-
-    res.json({ results });
+    const mode=String(req.query.mode||'hybrid');if(!['hybrid','semantic','keyword'].includes(mode))return res.status(400).json({error:{code:'BAD_REQUEST',message:'mode must be hybrid, semantic, or keyword'}});
+    const retrieved=await hybridRetrieve({userId:req.user!.id,query:qText,fileIds,name:nameFilter||null,limit:topK,mode:mode as 'hybrid'|'semantic'|'keyword'});
+    logClassroomUsageSafely(req.user!.id,'search',qText,retrieved.results.map(x=>x.unit_id));
+    res.json({results:retrieved.results.map(x=>({...x,snippet:x.text.slice(0,320)})),degraded:retrieved.degraded,mode});
   } catch (e) { next(e); }
 });
 

@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { pool, transaction } from '../db/pool.js';
 import { auth, canRead } from '../core/permissions.js';
 import { generateText, generateJson } from '../core/llm.js';
-import { embedText } from '../core/embed.js';
+import { hybridRetrieve } from '../core/retrieval.js';
+import { logClassroomUsageSafely } from '../core/analytics.js';
 import { sha256 } from '../core/hash.js';
 import { putObject } from '../core/storage.js';
 import { createRequire } from 'node:module';
@@ -70,67 +71,16 @@ r.post('/ask', async (req, res, next) => {
     if (typeof question !== 'string' || !question.trim()) {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'A question is required.' } });
     }
+    if(question.length>4000)return res.status(400).json({error:{code:'BAD_REQUEST',message:'Question must be 4000 characters or fewer.'}});
     if (!Array.isArray(fileIds) || fileIds.length === 0) {
       return res.status(400).json({ error: { code: 'BAD_REQUEST', message: 'Choose at least one file so the assistant has material to study.' } });
     }
+    if(fileIds.length>100||fileIds.some((id:any)=>typeof id!=='string'||!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id)))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Choose up to 100 valid file ids.'}});
 
     const userId = req.user!.id;
-    const topK = Number(process.env.RETRIEVAL_TOP_K || 8);
-    const minScore = Number(process.env.RETRIEVAL_MIN_SCORE || 0.35); // Lowered default for better recall
-
-    // Step 1: Embed the user question for semantic retrieval (with graceful fallback)
-    let queryVector: number[] | null = null;
-    try {
-      queryVector = await embedText(
-        `Represent this question for retrieving relevant document passages: ${question.trim()}`
-      );
-    } catch (embErr) {
-      console.warn('Embedding generation for question failed; proceeding with document fallback', embErr);
-    }
-
-    // Step 2: Retrieve relevant units via vector similarity search
-    let relevantUnits: any[] = [];
-    if (queryVector && queryVector.length === 768) {
-      const retrievalResult = await pool.query(
-        `SELECT
-           u.id unit_id, u.locator, u.text,
-           f.id file_id, f.name file_name,
-           fv.id version_id,
-           1 - (u.embedding <=> $1::vector) AS score
-         FROM units u
-         JOIN file_versions fv ON fv.id = u.version_id
-         JOIN files f ON f.id = fv.file_id
-         WHERE
-           u.embedding IS NOT NULL
-           AND fv.status = 'ready'
-           AND fv.retracted_at IS NULL
-           AND f.current_version_id = fv.id
-           AND f.deleted_at IS NULL
-           AND f.archived_at IS NULL
-           AND f.searchable = true
-           AND f.id = ANY($2::uuid[])
-           AND (
-             (f.owner_type = 'user' AND f.owner_id = $3)
-             OR (
-               f.owner_type = 'org'
-               AND f.owner_id IN (SELECT org_id FROM memberships WHERE user_id = $3)
-               AND (
-                 f.created_by = $3
-                 OR f.visibility = 'classroom'
-                 OR EXISTS (SELECT 1 FROM memberships fac WHERE fac.user_id = $3 AND fac.org_id = f.owner_id AND fac.role = 'faculty')
-                 OR EXISTS (SELECT 1 FROM file_shares fs WHERE fs.file_id = f.id AND fs.user_id = $3)
-               )
-             )
-           )
-         ORDER BY u.embedding <=> $1::vector
-         LIMIT $4`,
-        [`[${queryVector.join(',')}]`, fileIds, userId, topK * 3]
-      );
-
-      relevantUnits = retrievalResult.rows
-        .filter(r => Number(r.score) >= minScore)
-        .slice(0, topK);
-    }
+    const retrieval = await hybridRetrieve({userId,query:question.trim(),fileIds,limit:Number(process.env.RETRIEVAL_TOP_K||8),mode:'hybrid'});
+    const relevantUnits = retrieval.results.map(hit=>({...hit,score:hit.score}));
+    logClassroomUsageSafely(userId,'assistant',question.trim(),relevantUnits.map(x=>x.unit_id));
 
     // Load every indexed unit from the selected files. For documents that fit
     // in the context budget this lets broad questions use the complete file;
@@ -189,11 +139,10 @@ r.post('/ask', async (req, res, next) => {
     // Step 3: Build context string for Gemini (cap at MAX_CONTEXT_CHARS)
     const maxChars = Number(process.env.MAX_CONTEXT_CHARS || 120000);
     const allChars = allUnits.reduce((total, unit) => total + unit.text.length + unit.locator.length + unit.file_name.length + 24, 0);
+    if (!requestedPageUnits.length && relevantUnits.length===0) return res.json({answer:"I couldn't find relevant information in the selected files.",sources:[],degraded:retrieval.degraded});
     const contextUnits = requestedPageUnits.length
       ? requestedPageUnits
-      : allChars <= maxChars
-      ? allUnits
-      : [...relevantUnits, ...allUnits.filter(unit => !relevantUnits.some(relevant => relevant.unit_id === unit.unit_id))];
+      : relevantUnits;
     let contextStr = '';
     const usedUnits: typeof contextUnits = [];
     for (const unit of contextUnits) {
@@ -249,7 +198,7 @@ Answer the student's question based strictly on these excerpts.`;
         return true;
       });
 
-    res.json({ answer, sources });
+    res.json({ answer, sources, degraded:retrieval.degraded });
   } catch (e) { next(e); }
 });
 

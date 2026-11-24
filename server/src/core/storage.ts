@@ -1,4 +1,4 @@
-import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import { DeleteObjectCommand, GetObjectCommand, PutObjectCommand, PutBucketCorsCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { randomUUID } from 'node:crypto';
 
@@ -45,6 +45,13 @@ export async function signedPreview(key:string,filename:string,contentType:strin
 export async function removeObject(key:string){
   const missing=missingStorageVariables();if(missing.length)throw new Error(`Missing required environment variable: ${missing[0]}`);
   await sendStorageCommand(new DeleteObjectCommand({Bucket:process.env.S3_BUCKET,Key:key}));
+}
+
+export async function configureBucketCors(){
+  const origins=[...(process.env.CLIENT_ORIGIN||'').split(',').map(x=>x.trim()).filter(Boolean)];
+  if(process.env.NODE_ENV!=='production')origins.push('http://localhost:5173');
+  const unique=[...new Set(origins)];
+  await sendStorageCommand(new PutBucketCorsCommand({Bucket:process.env.S3_BUCKET,CORSConfiguration:{CORSRules:[{AllowedOrigins:unique,AllowedMethods:['PUT','GET','HEAD'],AllowedHeaders:['*'],ExposeHeaders:['ETag'],MaxAgeSeconds:3600}]}}));
 }
 
 export async function checkStorageRoundTrip(){

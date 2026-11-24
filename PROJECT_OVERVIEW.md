@@ -11,6 +11,8 @@ The product serves two account portals:
 
 Each user also has a private personal space. In a classroom, faculty can write course files; students can read files available to the class and, for student uploads, share with the whole class or selected classmates. Access is enforced by the server using the signed-in user's identity and classroom membership.
 
+Faculty can also post materials to the whole classroom or select specific students. Students can upload notes into a classroom and share them with the whole class or selected classmates. Selective sharing is enforced through classroom membership and per-file recipient records.
+
 ## What the application can do
 
 ### Files and classroom workflow
@@ -22,17 +24,23 @@ Each user also has a private personal space. In a classroom, faculty can write c
 - Retain multiple versions, view version history, compare extracted content, and inspect file lineage.
 - Archive and restore files; move files to Trash and restore them during the retention window.
 - Share student-uploaded classroom files with the class or chosen classmates.
+- Upload directly to object storage with short-lived signed URLs, pre-transfer exact-dedup checks, sequential multi-file support, progress feedback, and multipart fallback.
+- Process uploads through a durable Postgres queue with leased workers, bounded retries, visible job state, and retry controls.
 
 ### Content intelligence
 
 - Extract text at a document-appropriate level: DOCX paragraphs, PPTX slides, and PDF pages.
 - Detect byte-identical content with SHA-256 and reuse a stored blob within its storage scope.
-- Embed extracted units and run semantic search over files the user can access.
+- Embed extracted units and run hybrid keyword/vector search over files the user can access; keyword search is available as a fallback when embeddings fail.
 - Flag likely near-duplicate documents based on embedding similarity. Similarity is only a warning/link; it does not merge or remove content.
 - Ask the assistant questions about selected or otherwise accessible indexed files. Responses include source references and use retrieved excerpts as context.
 - Generate quizzes and presentations from accessible files. Quiz and presentation output is built by server-side code and stored as generated, non-searchable files.
 - Apply lifecycle rules that can archive a file after a period or after a watched file changes. Rules can have an initial dry-run period.
 - View storage/content statistics, including exact-dedup savings and repeated extracted content.
+- Compare simulated monthly storage-cost scenarios and upload bandwidth saved through pre-transfer deduplication. Tiering estimates do not move objects between real storage classes.
+- Take generated quizzes with server-side grading, review missed questions on a spaced schedule, and inspect attempt history and weak quizzes.
+- Add private or class-visible notes to extracted sections, reply and resolve notes, and carry annotations across versions when unit hashes match.
+- View professor-only pipeline metrics and classroom insights with cited materials, activity counts, and privacy-thresholded topic aggregates.
 
 ## How content moves through the system
 
@@ -40,7 +48,7 @@ Each user also has a private personal space. In a classroom, faculty can write c
 2. The API checks access and file constraints, hashes the bytes, and checks for a matching blob within the applicable scope.
 3. New bytes are written to S3-compatible object storage. The database then records the file/version/blob relationship.
 4. Background ingestion downloads and parses the file, stores extracted units, creates or reuses embeddings, records version lineage, and marks the version ready (or failed with an error).
-5. Search and assistant requests first restrict candidate material to files the user is authorized to access. Semantic ranking selects relevant units; the assistant receives those excerpts and can cite their source files and locations.
+5. Search and assistant requests first restrict candidate material to files the user is authorized to access. Hybrid ranking combines vector and English full-text candidates; the assistant receives relevant excerpts and can cite their source files and locations.
 
 ## Product principles and boundaries
 
@@ -56,9 +64,9 @@ These are opportunities for later iterations, not claims about current implement
 
 1. **OCR and scanned-document support** — make image-only lecture notes searchable and usable by the assistant.
 2. **University identity and roster integration** — add campus SSO and automatic course enrollment from a learning-management system.
-3. **Richer study workflows** — let students save study sets, track quiz attempts, and get explanations or revision plans tied to cited course material.
-4. **Instructor analytics** — show aggregate engagement and identify course topics that students search or ask about most, with privacy-conscious reporting.
-5. **Collaborative annotation** — add comments, highlights, and instructor annotations anchored to a page, slide, or paragraph.
+3. **Richer study workflows** — add saved study sets, adaptive revision plans, and progress summaries based on attempts and reviews.
+4. **Expanded instructor insights** — add privacy-conscious cohort trends and learning outcome summaries beyond current citation/activity aggregates.
+5. **Richer annotation collaboration** — add instructor highlights, deeper threaded discussions, and better annotation navigation across large documents.
 6. **Broader format and accessibility support** — support spreadsheets, accessible exports, captions/transcripts, and mobile-friendly views.
 7. **Operational hardening** — add automated integration tests, monitoring for ingestion failures and AI usage, and production-grade rate limits and request validation.
 
@@ -75,5 +83,5 @@ The PRD also lists real-time collaboration, billing, and physical storage tierin
 
 ## Current maturity
 
-The repository contains an end-to-end application implementation and production build artifacts, but external-service acceptance depends on configured Neon Postgres, S3-compatible object storage, and Gemini credentials. The repository's testing notes say a formal automated test suite is not currently defined; the manual demo checklist describes workflows that should be checked in a fully configured environment. Some product ideas in the PRD are not part of the current implementation and are listed above as future scope.
+The repository contains an end-to-end application implementation, unit tests, and database integration tests that skip when the configured database is unavailable. External-service acceptance depends on reachable Neon Postgres, S3-compatible object storage, and Gemini credentials. Some product ideas in the PRD are not part of the current implementation and are listed above as future scope.
 

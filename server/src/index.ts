@@ -10,8 +10,15 @@ import miscRoutes from './routes/misc.js';
 import classroomRoutes from './routes/classrooms.js';
 import { runGc } from './jobs/gc.js';
 import { runLifecycle } from './jobs/lifecycle.js';
+import { startWorker, stopWorker } from './worker.js';
+import { randomUUID } from 'node:crypto';
+import { logger } from './core/logger.js';
+import { configureBucketCors } from './core/storage.js';
+import studyRoutes from './routes/study.js';
+import annotationRoutes from './routes/annotations.js';
 
 const app = express();
+app.use((req,res,next)=>{const supplied=req.header('x-request-id');const requestId=supplied&&supplied.length<=128?supplied:randomUUID();res.setHeader('x-request-id',requestId);const started=Date.now();res.once('finish',()=>logger.info('http_request',{request_id:requestId,method:req.method,path:req.path,status:res.statusCode,duration_ms:Date.now()-started,user_id:req.user?.id}));next();});
 const allowedOrigins = new Set([
   'http://localhost:5173', 'http://127.0.0.1:5173',
   ...(process.env.CLIENT_ORIGIN || '').split(',').map(origin => origin.trim()).filter(Boolean),
@@ -31,12 +38,13 @@ app.use(express.json({ limit: '2mb' }));
 app.get('/api/health', async (_req, res) => {
   const aiConfigured = Boolean(process.env.GEMINI_API_KEY && process.env.EMBEDDING_MODEL && process.env.LLM_MODEL);
   const storageConfigured = Boolean(process.env.AWS_ENDPOINT_URL_S3 && process.env.AWS_REGION && process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY && process.env.S3_BUCKET);
-  if (!process.env.DATABASE_URL) return res.status(503).json({ ok: false, database: 'not_configured', authConfigured: Boolean(process.env.JWT_SECRET), aiConfigured, storageConfigured });
+  if (!process.env.DATABASE_URL) return res.status(503).json({ ok: false, database: 'not_configured', authConfigured: Boolean(process.env.JWT_SECRET), aiConfigured, storageConfigured, workerMode:process.env.WORKER_MODE||'embedded', queueDepth:null });
   try {
     await pool.query('SELECT 1');
-    res.json({ ok: true, database: 'connected', authConfigured: Boolean(process.env.JWT_SECRET), aiConfigured, storageConfigured });
+    const jobs=await pool.query("SELECT count(*)::int n FROM ingestion_jobs WHERE status IN ('queued','running')");
+    res.json({ ok: true, database: 'connected', authConfigured: Boolean(process.env.JWT_SECRET), aiConfigured, storageConfigured, workerMode:process.env.WORKER_MODE||'embedded', queueDepth:Number(jobs.rows[0]?.n||0) });
   } catch {
-    res.status(503).json({ ok: false, database: 'unavailable', authConfigured: Boolean(process.env.JWT_SECRET), aiConfigured, storageConfigured });
+    res.status(503).json({ ok: false, database: 'unavailable', authConfigured: Boolean(process.env.JWT_SECRET), aiConfigured, storageConfigured, workerMode:process.env.WORKER_MODE||'embedded', queueDepth:null });
   }
 });
 app.use('/api/auth', authRoutes);
@@ -44,6 +52,8 @@ app.use('/api/classrooms', classroomRoutes);
 app.use('/api/files', fileRoutes);
 app.use('/api/assistant', assistantRoutes);
 app.use('/api', miscRoutes);
+app.use('/api', studyRoutes);
+app.use('/api', annotationRoutes);
 
 // ─── PDF stream proxy ─────────────────────────────────────────────────────────
 // Serves PDF bytes directly from S3 through the API server.
@@ -97,7 +107,7 @@ app.get('/api/stream/:fileId', async (req, res) => {
     const bytes = await obj.Body!.transformToByteArray();
     res.send(Buffer.from(bytes));
   } catch (e) {
-    console.error('Stream error', e);
+    logger.error('pdf_stream_failed',{error:e instanceof Error?e.name:'unknown'});
     res.status(500).end();
   }
 });
@@ -108,7 +118,7 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
   const missingConfiguration = typeof err?.message === 'string' && err.message.startsWith('Missing required environment variable:');
   const missingVariable = missingConfiguration ? err.message.slice('Missing required environment variable:'.length).trim() : '';
   const status = err?.code === 'LIMIT_FILE_SIZE' ? 413 : databaseUnavailable || missingConfiguration ? 503 : Number(err?.statusCode) >= 400 && Number(err.statusCode) < 600 ? Number(err.statusCode) : 500;
-  console.error('API request failed.', err?.name || 'Error', databaseUnavailable ? 'database connection unavailable' : missingConfiguration ? 'service configuration incomplete' : err?.code || 'internal');
+  logger.error('api_request_failed',{error_name:err?.name||'Error',error_class:databaseUnavailable?'database_unavailable':missingConfiguration?'service_configuration_incomplete':err?.code||'internal'});
   res.status(status).json({ error: {
     code: status === 413 ? 'PAYLOAD_TOO_LARGE' : databaseUnavailable ? 'DATABASE_UNAVAILABLE' : missingConfiguration ? 'SERVICE_NOT_CONFIGURED' : err?.publicCode || (status === 400 ? 'BAD_REQUEST' : 'INTERNAL'),
     message: status === 413 ? `Maximum upload size is ${process.env.MAX_UPLOAD_MB || 20} MB` : databaseUnavailable ? 'The database is unavailable. Check the server health endpoint and DATABASE_URL configuration.' : missingConfiguration ? `Server configuration is missing ${missingVariable}. Contact the administrator.` : err?.publicMessage || (status === 400 ? 'Invalid request' : 'Internal server error'),
@@ -117,23 +127,28 @@ app.use((err: any, _req: express.Request, res: express.Response, _next: express.
 const port = Number(process.env.PORT || 3000);
 
 async function start() {
-  app.listen(port, () => console.log(`Gurukul-AI API listening on ${port}`));
-  if (!process.env.DATABASE_URL) { console.error('Database is not configured; API is running in diagnostic mode.'); return; }
+  app.listen(port, () => logger.info('api_listening',{port}));
+  if (!process.env.DATABASE_URL) { logger.warn('api_diagnostic_mode',{reason:'database_not_configured'}); return; }
   try {
     await withConnectionRetry(client => client.query('SELECT 1'));
     await pool.query("UPDATE file_versions SET status='failed',error='Interrupted' WHERE status='processing' AND created_at < now()-interval '10 minutes'");
   } catch {
-    console.error('Database is unavailable; API is running in diagnostic mode. Check DATABASE_URL and database connectivity.');
+    logger.warn('api_diagnostic_mode',{reason:'database_unavailable'});
     return;
   }
   if (process.env.DISABLE_JOBS !== 'true') {
-    const lifecycle = setInterval(() => { void runLifecycle().catch(() => console.error('Lifecycle job failed.')); }, 60 * 60 * 1000);
-    const gc = setInterval(() => { void runGc({ retentionDays: Number(process.env.TRASH_RETENTION_DAYS || 30) }).catch(() => console.error('GC job failed.')); }, 24 * 60 * 60 * 1000);
-    const reconcile = setInterval(async () => { try { const rows = await pool.query('SELECT b.id,count(fv.id)::int actual FROM blobs b LEFT JOIN file_versions fv ON fv.blob_id=b.id GROUP BY b.id HAVING b.ref_count<>count(fv.id)'); for (const row of rows.rows) await pool.query('UPDATE blobs SET ref_count=$1 WHERE id=$2', [row.actual, row.id]); } catch { console.error('Reconcile job failed.'); } }, 24 * 60 * 60 * 1000);
+    const lifecycle = setInterval(() => { void runLifecycle().catch(error => logger.error('lifecycle_job_failed',{error:error instanceof Error?error.message:'unknown'})); }, 60 * 60 * 1000);
+    const gc = setInterval(() => { void runGc({ retentionDays: Number(process.env.TRASH_RETENTION_DAYS || 30) }).catch(error => logger.error('gc_job_failed',{error:error instanceof Error?error.message:'unknown'})); }, 24 * 60 * 60 * 1000);
+    const reconcile = setInterval(async () => { try { const rows = await pool.query('SELECT b.id,count(fv.id)::int actual FROM blobs b LEFT JOIN file_versions fv ON fv.blob_id=b.id GROUP BY b.id HAVING b.ref_count<>count(fv.id)'); for (const row of rows.rows) await pool.query('UPDATE blobs SET ref_count=$1 WHERE id=$2', [row.actual, row.id]); } catch(error) { logger.error('reconcile_job_failed',{error:error instanceof Error?error.message:'unknown'}); } }, 24 * 60 * 60 * 1000);
     lifecycle.unref(); gc.unref(); reconcile.unref();
   }
+  if(process.env.DIRECT_UPLOAD!=='false')try{await configureBucketCors();logger.info('bucket_cors_configured');}catch(error){logger.warn('bucket_cors_setup_unavailable',{error:error instanceof Error?error.message:'provider rejected CORS setup'});}
+  if ((process.env.WORKER_MODE || 'embedded') === 'embedded') void startWorker();
 }
 
+process.once('SIGTERM', () => { void stopWorker(); });
+process.once('SIGINT', () => { void stopWorker(); });
+
 start().catch((error: any) => {
-  console.error('API initialization failed.', error?.name || 'Error');
+  logger.error('api_initialization_failed',{error_name:error?.name||'Error'});
 });

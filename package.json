@@ -8,11 +8,16 @@
     "dev:server": "tsx watch server/src/index.ts",
     "dev:client": "vite --config client/vite.config.ts --host 0.0.0.0",
     "typecheck": "tsc -p server/tsconfig.json --noEmit && tsc -p client/tsconfig.json",
+    "test": "vitest run",
+    "test:unit": "vitest run tests/unit",
     "build": "tsc -p server/tsconfig.json && tsc -p client/tsconfig.json && vite build --config client/vite.config.ts",
     "start": "node server/dist/index.js",
+    "worker": "tsx server/src/worker.ts",
+    "start:worker": "node server/dist/worker.js",
     "db:migrate": "tsx server/src/db/migrate.ts",
     "seed": "tsx server/src/db/seed.ts",
     "check:env": "tsx server/src/check-env.ts",
+    "setup:cors": "tsx server/scripts/setup-bucket-cors.ts",
     "gc": "tsx server/src/jobs/gc.ts",
     "reconcile": "tsx server/src/jobs/reconcile.ts",
     "lifecycle": "tsx server/src/jobs/lifecycle.ts"
@@ -27,8 +32,8 @@
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "fast-xml-parser": "^5.2.5",
-    "jszip": "^3.10.1",
     "jsonwebtoken": "^9.0.2",
+    "jszip": "^3.10.1",
     "multer": "^2.0.2",
     "pdfjs-dist": "^5.4.149",
     "pg": "^8.16.3",
@@ -54,6 +59,7 @@
     "tailwindcss": "^3.4.17",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
-    "vite": "^7.1.12"
+    "vite": "^7.1.12",
+    "vitest": "^5.1.1"
   }
 }

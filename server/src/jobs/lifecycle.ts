@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { pool, transaction } from '../db/pool.js';
+import { logger } from '../core/logger.js';
 
 export async function runLifecycle() {
   const dueRules = await pool.query(`SELECT r.id FROM lifecycle_rules r JOIN files f ON f.id=r.file_id WHERE r.state IN ('dry_run','active') AND f.deleted_at IS NULL AND f.archived_at IS NULL ORDER BY r.created_at`);
@@ -40,5 +41,5 @@ export async function runLifecycle() {
 }
 
 if (process.argv[1]?.replaceAll('\\','/').endsWith('/jobs/lifecycle.ts') || process.argv[1]?.replaceAll('\\','/').endsWith('/jobs/lifecycle.js')) {
-  runLifecycle().then(count => console.log(`Evaluated ${count} lifecycle rules.`)).catch(error => { console.error('Lifecycle evaluation failed.'); process.exitCode = 1; }).finally(() => pool.end());
+  runLifecycle().then(count => logger.info('lifecycle_complete',{evaluated:count})).catch(error => { logger.error('lifecycle_failed',{error:error instanceof Error?error.message:'unknown error'}); process.exitCode = 1; }).finally(() => pool.end());
 }
