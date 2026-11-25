@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { randomBytes } from 'node:crypto';
 import { pool, transaction } from '../db/pool.js';
 import { auth } from '../core/permissions.js';
+import { saveGenerated } from '../core/generated-files.js';
 import {filterKAnonymousTopics,tokenizeTopics} from '../core/analytics.js';
 
 const r = Router();
@@ -179,6 +180,35 @@ r.get('/:id', async (req, res, next) => {
     );
     res.json({ classroom: { ...q.rows[0], role: membership.rows[0].role } });
   } catch (error) { next(error); }
+});
+
+r.post('/:id/quizzes', async (req, res, next) => {
+  try {
+    const user = req.user!;
+    const classroomId = req.params.id;
+    if (user.accountRole !== 'professor' || !user.memberships.some(m => m.orgId === classroomId && m.role === 'faculty')) {
+      return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Only professors teaching this classroom can publish quizzes.' } });
+    }
+    const { title, questions } = req.body || {};
+    if (typeof title !== 'string' || !title.trim() || title.length > 160 ||
+        !Array.isArray(questions) || !questions.length || questions.length > 50) {
+      return res.status(400).json({error: {code: 'BAD_REQUEST', message: 'Enter a quiz title and 1 to 50 questions.'}});
+    }
+    const clean = [];
+    for (const q of questions) {
+      if (!q || typeof q.question !== 'string' || !q.question.trim() || q.question.length > 2000 ||
+          !Array.isArray(q.options) || q.options.length !== 4 ||
+          !q.options.every((o: unknown) => typeof o === 'string' && o.trim() && o.length <= 500) ||
+          new Set(q.options.map((o: string) => o.trim().toLowerCase())).size !== 4 ||
+          !Number.isInteger(q.correctIndex) || q.correctIndex < 0 || q.correctIndex >= 4) {
+        return res.status(400).json({error: {code: 'BAD_REQUEST', message: 'Each question needs four distinct choices and a correct answer.'}});
+      }
+      clean.push({ question: q.question.trim(), options: q.options.map((o: string) => o.trim()), correctIndex: q.correctIndex });
+    }
+    const quiz = { title: title.trim(), questions: clean };
+    const fileId = await saveGenerated(user.id, quiz.title, 'quiz', Buffer.from(JSON.stringify(quiz)), [], classroomId);
+    res.status(201).json({ fileId });
+  } catch (err) { next(err); }
 });
 
 export default r;

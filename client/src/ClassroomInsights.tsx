@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Glyph } from './interface';
+import { FacultyQuizzes } from './QuizDashboard';
 import { CalendarBars, calendarDays, ResourceNote } from './StudyDashboard';
 import { dayKey, documentUrl, useStudyResource, type Analytics, type Material } from './study-data';
 
@@ -61,6 +62,7 @@ export function FacultyOverview({token,courses}:{token:string;courses:FacultyCou
     <header className="faculty-cover"><div><p className="desk-meta">Faculty workspace</p><h1>Teaching dashboard</h1></div>
       {course&&<div className="course-selector"><label htmlFor="faculty-course">Classroom</label><select id="faculty-course" value={course.orgId} onChange={e=>setSelected(e.target.value)}>{faculty.map(c=><option key={c.orgId} value={c.orgId}>{c.code} · {c.name}</option>)}</select></div>}
     </header>
+    {course && <FacultyQuizzes key={course.orgId} token={token} classroomId={course.orgId} classroomName={course.name}/>}
     {course ? <ClassroomInsights key={course.orgId} token={token} classroomId={course.orgId}/> : <p className="desk-note">Classroom insights appear here once you teach a class.</p>}
   </section>;
 }

@@ -15,7 +15,7 @@ export type Analytics = {
 export type Material = { id:string; versions: {id:string; status:string; job_status?:string}[]; current_version_id?:string };
 
 type Result<T> = {data?: T; error?: string};
-export function useStudyResource<T>(path: string, token: string, poll = false): Result<T> {
+export function useStudyResource<T>(path: string, token: string, poll = false, revision = 0): Result<T> {
   const [result, setResult] = useState<Result<T> & {path:string; token:string}>();
   useEffect(() => {
     const controller = new AbortController();
@@ -36,7 +36,7 @@ export function useStudyResource<T>(path: string, token: string, poll = false): 
     }
     void load();
     return () => { controller.abort(); window.clearTimeout(timer); };
-  }, [path, token, poll]);
+  }, [path, token, poll, revision]);
   return result?.path === path && result.token === token ? result : {};
 }
 

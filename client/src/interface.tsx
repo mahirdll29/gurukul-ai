@@ -33,7 +33,7 @@ export function Brand() {
 export function Dialog({title,onDismiss,children}:{title:string;onDismiss:()=>void;children:ReactNode}) {
   const ref=useRef<HTMLDialogElement>(null);
   useEffect(()=>{const dialog=ref.current!; dialog.showModal(); return ()=>dialog.close();},[]);
-  return <dialog ref={ref} className="gk-modal" aria-label={title} onCancel={onDismiss} onClick={event=>{if(event.target===ref.current)onDismiss();}}>
+  return <dialog ref={ref} className="gk-modal" aria-label={title} onCancel={event=>{event.preventDefault();onDismiss();}} onClick={event=>{if(event.target===ref.current)onDismiss();}}>
     <div className="dialog-sheet"><div className="gk-modal-header"><h2>{title}</h2><button className="gk-icon-btn" aria-label="Close dialog" onClick={onDismiss}><Glyph name="close"/></button></div>{children}</div>
   </dialog>;
 }

@@ -1,11 +1,10 @@
 import { Router } from 'express';
-import { pool, transaction } from '../db/pool.js';
+import { pool } from '../db/pool.js';
 import { auth, canRead } from '../core/permissions.js';
 import { generateText, generateJson } from '../core/llm.js';
 import { hybridRetrieve } from '../core/retrieval.js';
 import { logClassroomUsageSafely } from '../core/analytics.js';
-import { sha256 } from '../core/hash.js';
-import { putObject } from '../core/storage.js';
+import { saveGenerated } from '../core/generated-files.js';
 import { logger } from '../core/logger.js';
 import { createRequire } from 'node:module';
 
@@ -80,10 +79,6 @@ r.post('/ask', async (req, res, next) => {
     if(fileIds.length>100||fileIds.some((id:any)=>typeof id!=='string'||!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id)))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Choose up to 100 valid file ids.'}});
 
     const userId = req.user!.id;
-    stage = 'retrieval';
-    const retrieval = await hybridRetrieve({userId,query:question.trim(),fileIds,limit:Number(process.env.RETRIEVAL_TOP_K||8),mode:'hybrid'});
-    const relevantUnits = retrieval.results.map(hit=>({...hit,score:hit.score}));
-    logClassroomUsageSafely(userId,'assistant',question.trim(),relevantUnits.map(x=>x.unit_id));
 
     // Only load an exact page when the question asks for one. Loading every
     // unit in every selected file on each turn made large libraries slow.
@@ -95,7 +90,7 @@ r.post('/ask', async (req, res, next) => {
          FROM units u
          JOIN file_versions fv ON fv.id = u.version_id
          JOIN files f ON f.id = fv.file_id
-         WHERE fv.status = 'ready' AND f.current_version_id = fv.id
+         WHERE fv.status = 'ready' AND fv.retracted_at IS NULL AND f.current_version_id = fv.id
            AND f.deleted_at IS NULL AND f.archived_at IS NULL AND f.searchable = true
            AND f.id = ANY($1::uuid[])
            AND f.format = 'pdf' AND u.locator = $3
@@ -126,16 +121,24 @@ r.post('/ask', async (req, res, next) => {
 
     // Step 3: Build context string for Gemini (cap at MAX_CONTEXT_CHARS)
     const maxChars = Number(process.env.MAX_CONTEXT_CHARS || 120000);
-    if (!requestedPageUnits.length && relevantUnits.length===0) return res.json({answer:"I couldn't find relevant information in the selected files.",sources:[],degraded:retrieval.degraded});
-    const contextUnits = requestedPageUnits.length
-      ? requestedPageUnits
-      : relevantUnits;
+    stage = 'retrieval';
+    const retrieval = requestedPage === null
+      ? await hybridRetrieve({userId,query:question.trim(),fileIds,limit:Number(process.env.RETRIEVAL_TOP_K||8),mode:'hybrid'})
+      : { results: requestedPageUnits, degraded: false };
+    const contextUnits = retrieval.results;
+    if (!contextUnits.length) return res.json({
+      answer: retrieval.degraded
+        ? "Search is running with limited results. I couldn't find a matching passage. Try a term from the file or ask about a specific PDF page."
+        : "I couldn't find relevant information in the selected files.",
+      sources: [], degraded: retrieval.degraded,
+    });
     let contextStr = '';
     const usedUnits: typeof contextUnits = [];
     for (const unit of contextUnits) {
-      const snippet = `[SOURCE: ${unit.file_name} | ${unit.locator}]\n${unit.text}\n\n`;
-      if (contextStr.length + snippet.length > maxChars) continue;
-      contextStr += snippet;
+      const header = `[SOURCE: ${unit.file_name} | ${unit.locator}]\n`;
+      const remaining = maxChars - contextStr.length - header.length - 2;
+      if (remaining <= 0) break;
+      contextStr += `${header}${unit.text.slice(0, remaining)}\n\n`;
       usedUnits.push(unit);
     }
 
@@ -156,7 +159,7 @@ You help students and professors understand course materials.
 
 IMPORTANT RULES:
 1. Answer ONLY using the provided SOURCE EXCERPTS below. Do not use outside knowledge.
-2. Be thorough, clear, and educational in your explanations.
+2. Give the direct answer first. Keep simple answers brief and explain in detail when the question calls for it.
 3. At the end of your answer, cite the specific sources you used in this format: [Source: filename | locator]
 4. If the excerpts do not contain enough information to answer the question, say so clearly.
 5. For complex topics, structure your answer with clear sections.
@@ -165,9 +168,6 @@ SOURCE EXCERPTS FROM CLASS MATERIALS:
 ${contextStr}
 
 Answer the student's question based strictly on these excerpts.`;
-
-    stage = 'gemini_generation';
-    const answer = await generateText(systemPrompt, question.trim(), geminiHistory);
 
     // Step 6: Build sources list (deduplicated by file+locator)
     const seen = new Set<string>();
@@ -186,7 +186,21 @@ Answer the student's question based strictly on these excerpts.`;
         return true;
       });
 
-    res.json({ answer, sources, degraded:retrieval.degraded });
+    logClassroomUsageSafely(userId,'assistant',question.trim(),usedUnits.map(x=>x.unit_id));
+    stage = 'gemini_generation';
+    try {
+      const answer = await generateText(systemPrompt, question.trim(), geminiHistory);
+      res.json({ answer, sources, degraded: retrieval.degraded });
+    } catch (error: any) {
+      if (!sources.length || !['AI_TIMEOUT', 'AI_CONNECTION_FAILED'].includes(error?.publicCode)) throw error;
+      logger.warn('assistant_source_fallback', {
+        request_id: String(res.getHeader('x-request-id') || ''), reason: error.message,
+      });
+      res.json({
+        answer: `${error.publicMessage} Here are passages from your selected files. You can ask again for an explanation.`,
+        sources, degraded: true,
+      });
+    }
   } catch (e) {
     logger.error('assistant_request_failed',{request_id:String(res.getHeader('x-request-id')||''),stage,error_name:e instanceof Error?e.name:'Error',error_message:String(e instanceof Error?e.message:e).slice(0,500)});
     next(e);
@@ -220,62 +234,49 @@ async function getSources(userId: string, ids: string[], limit: number) {
      ORDER BY f.id, u.idx`,
     [ids, userId]
   );
-  if (q.rows.length === 0) throw Error('No accessible, current source text is available');
+  if (!q.rows.length) throw Object.assign(new Error('No accessible source text'), {statusCode: 422, publicMessage: 'Choose a ready resource with readable text.'});
   const rows = q.rows;
-    const max = Number(process.env.MAX_CONTEXT_CHARS || 120000);
+  const max = limit;
   const sample: typeof rows = [];
   let total = 0;
   const step = Math.max(1, Math.ceil(rows.length / Math.max(1, Math.floor(max / 1200))));
   for (let i = 0; i < rows.length; i += step) {
-    if (total + rows[i].text.length > max) continue;
-    sample.push(rows[i]);
-    total += rows[i].text.length;
+    const text = rows[i].text.slice(0, max - total);
+    if (!text) continue;
+    sample.push({...rows[i], text});
+    total += text.length;
+    if (total >= max) break;
   }
   return sample;
 }
 
-// ─── Helper: save AI-generated file to storage + DB ───────────────────────────
-async function saveGenerated(userId: string, name: string, format: 'quiz' | 'pptx', bytes: Buffer, sources: any[]) {
-  const hash = sha256(bytes), key = `user/${userId}/${hash}`;
-  let blob = (await pool.query("SELECT * FROM blobs WHERE scope_type='user' AND scope_id=$1 AND sha256=$2", [userId, hash])).rows[0];
-  if (!blob) {
-    await putObject(key, bytes, format === 'pptx'
-      ? 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-      : 'application/json');
-    blob = (await pool.query("INSERT INTO blobs(scope_type,scope_id,sha256,size_bytes,storage_key) VALUES('user',$1,$2,$3,$4) RETURNING *", [userId, hash, bytes.length, key])).rows[0];
-  }
-  const fileId = await transaction(async c => {
-    const f = (await c.query("INSERT INTO files(owner_type,owner_id,name,format,kind,searchable,created_by) VALUES('user',$1,$2,$3,'generated',false,$1) RETURNING id", [userId, name, format])).rows[0].id;
-    const v = (await c.query("INSERT INTO file_versions(file_id,version_no,blob_id,original_name,size_bytes,sha256,status,uploaded_by) VALUES($1,1,$2,$3,$4,$5,'ready',$6) RETURNING id", [f, blob.id, name, bytes.length, hash, userId])).rows[0].id;
-    await c.query('UPDATE files SET current_version_id=$1 WHERE id=$2', [v, f]);
-    await c.query('UPDATE blobs SET ref_count=ref_count+1 WHERE id=$1', [blob.id]);
-    for (const s of [...new Map(sources.map(x => [x.version_id, x])).values()]) {
-      await c.query("INSERT INTO lineage_edges(from_version_id,to_version_id,kind) VALUES($1,$2,'derived') ON CONFLICT DO NOTHING", [s.version_id, v]);
-    }
-    return f;
-  });
-  return fileId;
-}
+
 
 // ─── POST /quiz ────────────────────────────────────────────────────────────────
 r.post('/quiz', async (req, res, next) => {
   try {
     const { fileIds, numQuestions = 10, difficulty = 'medium' } = req.body || {};
+    if (!Array.isArray(fileIds) || fileIds.length < 1 || fileIds.length > 100 ||
+        fileIds.some(id => typeof id !== 'string' || !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(id)) ||
+        !Number.isInteger(numQuestions) || numQuestions < 1 || numQuestions > 50 || !['easy','medium','hard'].includes(difficulty)) {
+      return res.status(400).json({error: {code: 'BAD_REQUEST', message: 'Choose ready resources, a difficulty and 1 to 50 questions.'}});
+    }
     const units = await getSources(req.user!.id, fileIds, Number(process.env.MAX_CONTEXT_CHARS || 120000));
     const excerpts = units.map(x => `[${x.name}, ${x.locator}] ${x.text}`).join('\n');
     let quiz: any;
     for (let attempt = 0; attempt < 2; attempt++) {
       quiz = await generateJson(
-        'Create an educational quiz only from the supplied source excerpts. Return JSON with title and questions. Every question must have four distinct options, one integer correctIndex from 0 to 3, a nonempty explanation and a locator.',
+        'Use only the source excerpts. Return JSON with a string title and a questions array of the requested length. Each entry must have question (string), options (four distinct strings), correctIndex (integer 0–3), explanation (string) and locator (source location).',
         JSON.stringify({ numQuestions, difficulty, excerpts })
       );
       if (
-        Array.isArray(quiz.questions) &&
+        typeof quiz?.title === 'string' && Array.isArray(quiz.questions) &&
         quiz.questions.length === numQuestions &&
         quiz.questions.every((x: any) =>
-          x.question && Array.isArray(x.options) && x.options.length === 4 &&
+          typeof x?.question === 'string' && x.question.trim() && Array.isArray(x.options) && x.options.length === 4 &&
+          x.options.every((o: unknown) => typeof o === 'string' && o.trim()) &&
           new Set(x.options).size === 4 && Number.isInteger(x.correctIndex) &&
-          x.correctIndex >= 0 && x.correctIndex <= 3 && x.explanation && x.locator
+          x.correctIndex >= 0 && x.correctIndex <= 3 && typeof x.explanation === 'string' && x.explanation.trim() && typeof x.locator === 'string' && x.locator.trim()
         )
       ) break;
       quiz = null;
@@ -332,7 +333,11 @@ r.get('/files/:id/quiz', async (req, res, next) => {
     const { s3 } = await import('../core/storage.js');
     const q = await pool.query('SELECT b.storage_key FROM file_versions fv JOIN blobs b ON b.id=fv.blob_id WHERE fv.id=$1', [f.current_version_id]);
     const o = await s3.send(new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: q.rows[0].storage_key }));
-    res.json({ quiz: JSON.parse(Buffer.from(await o.Body!.transformToByteArray()).toString()) });
+    const quiz = JSON.parse(Buffer.from(await o.Body!.transformToByteArray()).toString());
+    if (f.owner_type === 'org') {
+      return res.json({quiz: {title: quiz.title, questions: quiz.questions.map((q: any) => ({question: q.question, options: q.options}))}});
+    }
+    res.json({ quiz });
   } catch (e) { next(e); }
 });
 

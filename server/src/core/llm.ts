@@ -1,8 +1,10 @@
+import { logger } from './logger.js';
+
 type GeminiTurn = { role: 'user' | 'model'; parts: { text: string }[] };
 
 function getModelCandidates(): string[] {
-  const primary = process.env.LLM_MODEL?.trim().replace(/^models\//, '') || 'gemini-3.1-flash-lite';
-  const fallbacks = ['gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-3.8-flash'];
+  const primary = process.env.LLM_MODEL?.trim().replace(/^models\//, '') || 'gemini-3.5-flash-lite';
+  const fallbacks = ['gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-3.8-flash'];
   return [...new Set([primary, ...fallbacks])];
 }
 
@@ -10,67 +12,84 @@ async function generate(system: string, contents: GeminiTurn[], json: boolean) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error('Missing required environment variable: GEMINI_API_KEY');
 
-  const models = getModelCandidates();
+  const timeoutMs = Number(process.env.LLM_TIMEOUT_MS || (json ? 45_000 : 25_000));
+  const deadline = AbortSignal.timeout(timeoutMs);
+  let retriedConnection = false;
   let lastStatus = 0;
-  let lastErrorMsg = '';
 
-  for (const model of models) {
+  const models = getModelCandidates();
+  nextModel: for (const [index, model] of models.entries()) {
+    // Reserve part of the chat deadline for a second model if the first stalls.
+    const signal = index === 0 && !json
+      ? AbortSignal.any([deadline, AbortSignal.timeout(Math.min(12_000, Math.floor(timeoutMs / 2)))])
+      : deadline;
+    const started = Date.now();
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
-    let response: Response | undefined;
+    const body = JSON.stringify({
+      systemInstruction: { parts: [{ text: system }] },
+      contents,
+      generationConfig: {
+        temperature: 0.3,
+        ...(json ? { responseMimeType: 'application/json' } : {}),
+        ...(!json && model === 'gemini-3.1-flash-lite' ? { thinkingConfig: { thinkingLevel: 'MINIMAL' } } : {}),
+      },
+    });
 
-    for (let attempt = 0; attempt < 2; attempt++) {
+    while (true) {
       try {
-        response = await fetch(url, {
+        const response = await fetch(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json', 'x-goog-api-key': key },
-          body: JSON.stringify({
-            systemInstruction: { parts: [{ text: system }] },
-            contents,
-            generationConfig: { temperature: 0.3, ...(json ? { responseMimeType: 'application/json' } : {}) },
-          }),
-          signal: AbortSignal.timeout(Number(process.env.LLM_TIMEOUT_MS || 45_000)),
+          body,
+          signal,
         });
-      } catch (err: any) {
-        lastStatus = 0;
-        lastErrorMsg = err?.message || 'Network error';
-        break;
-      }
-
-      if (response && response.ok) {
-        let payload: any;
-        try { payload = await response.json(); }
-        catch { lastStatus = response.status; lastErrorMsg = 'Gemini returned invalid JSON'; break; }
-        const text = payload.candidates?.[0]?.content?.parts?.map((part: any) => part.text || '').join('').trim();
-        if (text) return text;
         lastStatus = response.status;
-        lastErrorMsg = payload.promptFeedback?.blockReason || 'Gemini returned no text candidate';
+        if (!response.ok) {
+          await response.body?.cancel();
+          break;
+        }
+        const payload = await response.json();
+        const text = payload.candidates?.[0]?.content?.parts
+          ?.filter((part: { thought?: boolean }) => !part.thought)
+          .map((part: { text?: string }) => part.text || '').join('').trim();
+        if (text) return text;
         break;
+      } catch (err: any) {
+        if (signal.aborted && !deadline.aborted && signal !== deadline) {
+          logger.warn('gemini_model_timeout', {
+            model, next_model: models[index + 1], duration_ms: Date.now() - started,
+          });
+          continue nextModel;
+        }
+        if (err instanceof SyntaxError) break;
+        const code = err?.cause?.code || err?.name || 'NETWORK_ERROR';
+        if (!signal.aborted && !retriedConnection &&
+          ['ECONNRESET', 'EAI_AGAIN', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT', 'ETIMEDOUT'].includes(code)) {
+          retriedConnection = true;
+          continue;
+        }
+        const timedOut = signal.aborted || code === 'UND_ERR_CONNECT_TIMEOUT' || code === 'ETIMEDOUT';
+        throw Object.assign(new Error(`Gemini request failed for ${model} (${code}).`), {
+          statusCode: timedOut ? 504 : 502,
+          publicCode: timedOut ? 'AI_TIMEOUT' : 'AI_CONNECTION_FAILED',
+          publicMessage: timedOut ? 'Gemini took too long to respond.' : 'The server could not reach Gemini.',
+        });
       }
-
-      lastStatus = response?.status || 0;
-      try {
-        const payload: any = await response?.clone().json();
-        lastErrorMsg = payload.error?.message || lastErrorMsg;
-      } catch { /* Keep the transport error when the provider returned no JSON body. */ }
-      if (![404, 429, 500, 503].includes(lastStatus)) {
-        // Unrecoverable status for this model
-        break;
-      }
-      await new Promise(resolve => setTimeout(resolve, 300 * 2 ** attempt));
     }
-    if (!lastStatus && lastErrorMsg) break;
-    if ([400, 401, 403].includes(lastStatus)) break;
+    if (![404, 429, 500, 503].includes(lastStatus)) break;
   }
 
-  const publicMessage = !lastStatus
-    ? 'Could not connect to Gemini. Check outbound network access and the Gemini API key.'
-    : lastStatus === 200
-      ? 'Gemini returned no answer. Check whether the prompt was blocked, then try again.'
-      : `Gemini returned HTTP ${lastStatus}. Check the API key, model access, and usage quota.`;
-  throw Object.assign(new Error(`Gemini generation failed (${lastStatus || lastErrorMsg}).`), {
+  const messages: Record<number, string> = {
+    200: 'Gemini returned no usable answer. Try rephrasing your question.',
+    401: 'Gemini rejected the configured API key.',
+    403: 'Gemini denied access. Check the server API key permissions.',
+    404: 'Gemini could not find an available generation model.',
+    429: 'Gemini reached its usage limit. Try again later.',
+  };
+  throw Object.assign(new Error(`Gemini generation failed (HTTP ${lastStatus}).`), {
     statusCode: 502,
     publicCode: 'AI_UNAVAILABLE',
-    publicMessage,
+    publicMessage: messages[lastStatus] || `Gemini returned HTTP ${lastStatus}.`,
   });
 }
 

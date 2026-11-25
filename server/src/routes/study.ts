@@ -12,7 +12,7 @@ export function nextReviewSchedule(currentBox:number,correct:boolean,exists:bool
   const box=Math.min(4,Math.max(1,currentBox)+1),days=[1,3,7,14][box-1];return{box,dueAt:new Date(now+days*86400000)};
 }
 async function readQuiz(fileId:string){
-  const q=await pool.query('SELECT b.storage_key FROM files f JOIN file_versions v ON v.id=f.current_version_id JOIN blobs b ON b.id=v.blob_id WHERE f.id=$1 AND f.format=\'quiz\' AND v.status=\'ready\'',[fileId]);
+  const q=await pool.query('SELECT b.storage_key FROM files f JOIN file_versions v ON v.id=f.current_version_id JOIN blobs b ON b.id=v.blob_id WHERE f.id=$1 AND f.format=\'quiz\' AND v.retracted_at IS NULL AND v.status=\'ready\'',[fileId]);
   if(!q.rowCount)return null;const obj=await s3.send(new GetObjectCommand({Bucket:process.env.S3_BUCKET,Key:q.rows[0].storage_key}));return JSON.parse(Buffer.from(await obj.Body!.transformToByteArray()).toString());
 }
 async function gradeAndSchedule(userId:string,fileId:string,answers:any[],quiz:any){
@@ -24,10 +24,45 @@ async function gradeAndSchedule(userId:string,fileId:string,answers:any[],quiz:a
   return{score,total:quiz.questions.length,answers:judged.map(a=>({...a,correctIndex:quiz.questions[a.questionIndex].correctIndex,explanation:quiz.questions[a.questionIndex].explanation||''}))};
 }
 
-r.post('/quizzes/:fileId/attempts',async(req,res,next)=>{try{if(!uuid.test(req.params.fileId))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid quiz id'}});const f=await canRead(req.user!.id,req.params.fileId);if(!f||f.format!=='quiz')return res.status(404).json({error:{code:'NOT_FOUND',message:'Quiz not found'}});const quiz=await readQuiz(f.id);if(!Array.isArray(quiz?.questions))return res.status(422).json({error:{code:'INVALID_QUIZ',message:'Quiz data is unavailable'}});res.json(await gradeAndSchedule(req.user!.id,f.id,req.body?.answers,quiz));}catch(e){next(e);}});
+r.post('/quizzes/:fileId/attempts', async (req, res, next) => {
+  try {
+    if (!uuid.test(req.params.fileId)) return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid quiz id'}});
+    const file = await canRead(req.user!.id, req.params.fileId);
+    if (!file || file.format !== 'quiz' || file.archived_at) return res.status(404).json({error:{code:'NOT_FOUND',message:'Quiz not found'}});
+    const quiz = await readQuiz(file.id);
+    if (!Array.isArray(quiz?.questions)) return res.status(422).json({error:{code:'INVALID_QUIZ',message:'Quiz data is unavailable'}});
+    const answers = req.body?.answers;
+    if (file.owner_type === 'org' && (!Array.isArray(answers) || answers.length !== quiz.questions.length)) {
+      return res.status(400).json({error:{code:'BAD_REQUEST',message:'Answer every question before submitting the classroom quiz.'}});
+    }
+    res.json(await gradeAndSchedule(req.user!.id, file.id, answers, quiz));
+  } catch (e) { next(e); }
+});
 r.get('/quizzes/:fileId/attempts',async(req,res,next)=>{try{if(!uuid.test(req.params.fileId))return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid quiz id'}});const f=await canRead(req.user!.id,req.params.fileId);if(!f||f.format!=='quiz')return res.status(404).json({error:{code:'NOT_FOUND',message:'Quiz not found'}});const q=await pool.query('SELECT id,score,total,created_at FROM quiz_attempts WHERE user_id=$1 AND quiz_file_id=$2 ORDER BY created_at DESC LIMIT 50',[req.user!.id,f.id]);res.json({attempts:q.rows});}catch(e){next(e);}});
 r.get('/study/review-queue',async(req,res,next)=>{try{const q=await pool.query(`SELECT ri.id,ri.quiz_file_id,ri.question_index,ri.box,ri.due_at,f.name quiz_name,b.storage_key FROM review_items ri JOIN files f ON f.id=ri.quiz_file_id JOIN file_versions v ON v.id=f.current_version_id JOIN blobs b ON b.id=v.blob_id WHERE ri.user_id=$1 AND ri.due_at<=now() AND v.status='ready' AND ((f.owner_type='user' AND f.owner_id=$1) OR (f.owner_type='org' AND f.owner_id IN(SELECT org_id FROM memberships WHERE user_id=$1) AND (f.created_by=$1 OR f.visibility='classroom' OR EXISTS(SELECT 1 FROM memberships m WHERE m.user_id=$1 AND m.org_id=f.owner_id AND m.role='faculty') OR EXISTS(SELECT 1 FROM file_shares fs WHERE fs.file_id=f.id AND fs.user_id=$1)))) ORDER BY ri.due_at LIMIT 50`,[req.user!.id]);const items=[];for(const item of q.rows){const obj=await s3.send(new GetObjectCommand({Bucket:process.env.S3_BUCKET,Key:item.storage_key}));const quiz=JSON.parse(Buffer.from(await obj.Body!.transformToByteArray()).toString()),question=quiz.questions[item.question_index];if(question)items.push({id:item.id,quizFileId:item.quiz_file_id,quizName:item.quiz_name,questionIndex:item.question_index,box:item.box,dueAt:item.due_at,question:question.question,options:question.options});}res.json({items});}catch(e){next(e);}});
 r.post('/study/review-queue/:id/answer',async(req,res,next)=>{try{if(!uuid.test(req.params.id)||!Number.isInteger(req.body?.selectedIndex)||req.body.selectedIndex<0)return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid review answer'}});const q=await pool.query('SELECT * FROM review_items WHERE id=$1 AND user_id=$2',[req.params.id,req.user!.id]);if(!q.rowCount)return res.status(404).json({error:{code:'NOT_FOUND',message:'Review item not found'}});const item=q.rows[0],f=await canRead(req.user!.id,item.quiz_file_id);if(!f)return res.status(404).json({error:{code:'NOT_FOUND',message:'Quiz not found'}});const quiz=await readQuiz(item.quiz_file_id),question=quiz?.questions[item.question_index];if(!question||req.body.selectedIndex>=question.options.length)return res.status(400).json({error:{code:'BAD_REQUEST',message:'Invalid answer option'}});const correct=req.body.selectedIndex===question.correctIndex,schedule=nextReviewSchedule(Number(item.box),correct,true);await pool.query('UPDATE review_items SET box=$1,due_at=$2,last_result=$3,times_seen=times_seen+1 WHERE id=$4',[schedule!.box,schedule!.dueAt,correct,item.id]);res.json({correct,correctIndex:question.correctIndex,explanation:question.explanation||'',nextDue:schedule!.dueAt});}catch(e){next(e);}});
 r.get('/study/weak-topics',async(req,res,next)=>{try{const q=await pool.query(`SELECT f.id quiz_file_id,f.name quiz_name,count(*)::int misses FROM quiz_attempts qa JOIN files f ON f.id=qa.quiz_file_id CROSS JOIN LATERAL jsonb_array_elements(qa.answers) a WHERE qa.user_id=$1 AND a->>'isCorrect'='false' AND ((f.owner_type='user' AND f.owner_id=$1) OR (f.owner_type='org' AND f.owner_id IN(SELECT org_id FROM memberships WHERE user_id=$1) AND (f.created_by=$1 OR f.visibility='classroom' OR EXISTS(SELECT 1 FROM memberships m WHERE m.user_id=$1 AND m.org_id=f.owner_id AND m.role='faculty') OR EXISTS(SELECT 1 FROM file_shares fs WHERE fs.file_id=f.id AND fs.user_id=$1)))) GROUP BY f.id,f.name ORDER BY misses DESC LIMIT 10`,[req.user!.id]);res.json({topics:q.rows,grouping:'Quiz source; generated questions do not retain source file identifiers.'});}catch(e){next(e);}});
 r.get('/study/attempts',async(req,res,next)=>{try{const q=await pool.query(`SELECT qa.id,qa.quiz_file_id,f.name quiz_name,qa.score,qa.total,qa.created_at FROM quiz_attempts qa JOIN files f ON f.id=qa.quiz_file_id WHERE qa.user_id=$1 AND ((f.owner_type='user' AND f.owner_id=$1) OR (f.owner_type='org' AND f.owner_id IN(SELECT org_id FROM memberships WHERE user_id=$1) AND (f.created_by=$1 OR f.visibility='classroom' OR EXISTS(SELECT 1 FROM memberships m WHERE m.user_id=$1 AND m.org_id=f.owner_id AND m.role='faculty') OR EXISTS(SELECT 1 FROM file_shares fs WHERE fs.file_id=f.id AND fs.user_id=$1)))) ORDER BY qa.created_at DESC LIMIT 50`,[req.user!.id]);res.json({attempts:q.rows});}catch(e){next(e);}});
+r.get('/study/quizzes', async (req, res, next) => {
+  try {
+    const q = await pool.query(
+      `SELECT f.id, f.name, f.owner_type, f.owner_id, o.name classroom_name,
+              last_attempt.score, last_attempt.total,
+              CASE WHEN m.role='faculty' THEN (
+                SELECT count(DISTINCT a.user_id)::int FROM quiz_attempts a
+                JOIN memberships student ON student.user_id=a.user_id AND student.org_id=f.owner_id AND student.role='student'
+                WHERE a.quiz_file_id=f.id
+              ) END students_attempted
+       FROM files f JOIN file_versions v ON v.id=f.current_version_id
+       LEFT JOIN orgs o ON f.owner_type='org' AND o.id=f.owner_id
+       LEFT JOIN memberships m ON m.org_id=o.id AND m.user_id=$1
+       LEFT JOIN LATERAL (SELECT score,total FROM quiz_attempts a WHERE a.user_id=$1 AND a.quiz_file_id=f.id
+                          ORDER BY created_at DESC LIMIT 1) last_attempt ON true
+       WHERE f.format='quiz' AND f.deleted_at IS NULL AND f.archived_at IS NULL AND v.status='ready' AND v.retracted_at IS NULL
+         AND ((f.owner_type='user' AND f.owner_id=$1) OR (m.user_id IS NOT NULL AND f.visibility='classroom'))
+       ORDER BY f.created_at DESC, f.id`, [req.user!.id]);
+    res.json({ quizzes: q.rows });
+  } catch (err) { next(err); }
+});
+
 export default r;

@@ -2,6 +2,7 @@ import { useId, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { Glyph } from './interface';
 import { Saara } from './Saara';
+import { StudentQuizzes } from './QuizDashboard';
 import { useRevisionSession } from './RevisionSession';
 import { dayKey, documentUrl, shortDate, useStudyResource, type Attempt, type Course, type LibraryFile, type ReadingEntry, type Review } from './study-data';
 
@@ -30,7 +31,7 @@ export function calendarDays(count:number, counts:Map<string,number>, end=new Da
 
 type Props = { token:string; name:string; courses:Course[]; loading:boolean; classError?:string; history:ReadingEntry[]; join:()=>void };
 export function StudentDashboard({token,name,courses,loading,classError,history,join}:Props) {
-  const attempts=useStudyResource<{attempts:Attempt[]}>('/study/attempts',token);
+  const attempts=useStudyResource<{attempts:Attempt[]}>('/study/attempts',token,true);
   const reviews=useStudyResource<{items:Review[]}>('/study/review-queue',token);
   const {upcoming} = useRevisionSession();
   const library=useStudyResource<{files:LibraryFile[]}>('/assistant/library',token,history.length>0 || upcoming.length>0);
@@ -80,6 +81,7 @@ export function StudentDashboard({token,name,courses,loading,classError,history,
       courses.length ? <div className="course-shelves">{courses.map(c=><Link className="course-shelf gk-classroom-card" key={c.id} to={'/classroom/'+c.id}><span className="course-symbol"><Glyph name="classroom"/></span><span><small>{c.code}</small><strong>{c.name}</strong>{c.description && <span className="course-description">{c.description}</span>}</span><Glyph name="send"/></Link>)}</div> :
       <p className="desk-note">Join a classroom with the code from your professor.</p>}
     </section>
+    <StudentQuizzes token={token}/>
     <div className="desk-spread performance-spread"><section className="desk-panel"><div className="desk-section-head"><h2>Study activity</h2><span>Last 7 days</span></div>
       {attempts.data ? <><p className="activity-total"><strong>{weekCount}</strong> quiz {weekCount===1?'attempt':'attempts'}</p>
         <CalendarBars points={days} label="Quiz attempts by day" unit="attempts"/>

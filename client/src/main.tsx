@@ -402,6 +402,7 @@ function PortalPage({ user, portal, token, onMembership, history, showStorage=fa
         </div>
         <div className="gk-portal-actions">
           <button className="gk-btn gk-btn-primary" onClick={() => setShowCreate(true)}>{Icon.plus} New Classroom</button>
+          {courses.length > 0 && <Link className="gk-btn gk-btn-secondary" to="/dashboard#classroom-quizzes">Classroom quizzes</Link>}
           <Link className="gk-btn gk-btn-secondary" to="/assistant">{Icon.ai} AI Assistant</Link>
         </div>
       </div>}
@@ -946,7 +947,7 @@ function QuizViewer({ token, fileId, quiz }: { token:string; fileId:string; quiz
     } catch(err) { setError(err instanceof Error ? err.message : 'Could not submit quiz.'); }
     finally { setBusy(false); }
   }
-  return <form onSubmit={submit}><h2>{quiz.title||'Study quiz'}</h2>{(quiz.questions||[]).map((question:any,index:number)=><section className="gk-stat-card" style={{marginBottom:12}} key={index}><strong>{index+1}. {question.question}</strong>{question.options.map((option:string,choice:number)=><label key={choice} style={{display:'block',padding:'6px 0'}}><input type="radio" name={`q-${index}`} checked={answers[index]===choice} disabled={!!result} onChange={()=>setAnswers(a=>({...a,[index]:choice}))}/> {option}</label>)}{result&&(()=>{const graded=result.answers.find((a:any)=>a.questionIndex===index);return <p className="gk-hint">{graded?.isCorrect?'Correct.':`Correct answer: ${question.options[graded?.correctIndex]}.`} {graded?.explanation}</p>;})()}</section>)}{error&&<p className="gk-error">{error}</p>}{result?<p className="gk-notice">Score: {result.score} / {result.total}</p>:<button className="gk-btn gk-btn-primary" disabled={busy||Object.keys(answers).length!==quiz.questions.length}>{busy?'Submitting…':'Submit quiz'}</button>}</form>;
+  return <form onSubmit={submit}><h2>{quiz.title||'Study quiz'}</h2>{(quiz.questions||[]).map((question:any,index:number)=><section className="gk-stat-card" style={{marginBottom:12}} key={index}><strong>{index+1}. {question.question}</strong>{question.options.map((option:string,choice:number)=><label key={choice} style={{display:'block',padding:'6px 0'}}><input type="radio" name={`q-${index}`} checked={answers[index]===choice} disabled={!!result} onChange={()=>setAnswers(a=>({...a,[index]:choice}))}/> {option}</label>)}{result&&(()=>{const graded=result.answers.find((a:any)=>a.questionIndex===index);return <p className="gk-hint">{graded?.isCorrect?'Correct.':`Correct answer: ${question.options[graded?.correctIndex]}.`} {graded?.explanation}</p>;})()}</section>)}{error&&<p className="gk-error">{error}</p>}{result?<div className="gk-notice" role="status">Score: {result.score} / {result.total} · <Link to="/dashboard">View dashboard</Link></div>:<button className="gk-btn gk-btn-primary" disabled={busy||Object.keys(answers).length!==quiz.questions.length}>{busy?'Submitting…':'Submit quiz'}</button>}</form>;
 }
 
 function AnnotationPanel({token,fileId,versionId,units,format,classroom}:{token:string;fileId:string;versionId:string;units:any[];format:string;classroom:boolean}){
@@ -1069,9 +1070,9 @@ function FilePage({ token, onRead }: { token: string; onRead?:(entry:ReadingEntr
         <div className="gk-file-title-row">
           <div>
             <h1>{f.name}</h1>
-            <p>{f.format.toUpperCase()} · version {preview.versionNo}</p>
+            <p>{f.format.toUpperCase()} · version {preview.versionNo ?? currentVersion?.version_no}</p>
           </div>
-          <Link className="gk-btn gk-btn-primary" to={`/assistant?fileId=${f.id}`}>{Icon.ai} Study with AI</Link>
+          {f.format === 'quiz' ? <Link className="gk-btn gk-btn-secondary" to="/dashboard">Quiz dashboard</Link> : <Link className="gk-btn gk-btn-primary" to={`/assistant?fileId=${f.id}`}>{Icon.ai} Study with AI</Link>}
         </div>
       </div>
 
